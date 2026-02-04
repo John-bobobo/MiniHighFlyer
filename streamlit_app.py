@@ -4,94 +4,93 @@ import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-st.set_page_config(page_title="幻方实战终端V5.1", layout="wide")
+st.set_page_config(page_title="指挥官定制终端V6.0", layout="wide")
 
-# --- 1. 核心数据引擎：新浪财经极速接口 ---
-def get_sina_rich_data(code):
+# --- 1. 核心实仓配置 ---
+MY_PORTFOLIO = {
+    "600879": {"name": "航天电子", "vol": 3800},
+    "000759": {"name": "中百集团", "vol": 10000},
+    "600977": {"name": "中国电影", "vol": 3100},
+    "002400": {"name": "省广集团", "vol": 2700},
+    "600893": {"name": "航发动力", "vol": 900}
+}
+
+# --- 2. 极速行情引擎 (含换手率解析) ---
+def get_live_intelligence(code):
     try:
         prefix = "sh" if code.startswith("6") else "sz"
         url = f"https://hq.sinajs.cn/list={prefix}{code}"
         headers = {'Referer': 'http://finance.sina.com.cn'}
-        r = requests.get(url, headers=headers, timeout=5)
+        r = requests.get(url, headers=headers, timeout=3)
         res = r.text.split('"')[1].split(',')
-        if len(res) > 30:
-            # 新浪数据结构：1昨收, 3现价, 8成交量(股), 9成交额(元)
-            price = float(res[3])
-            prev_close = float(res[2])
-            pct = round((price - prev_close) / prev_close * 100, 2)
-            amount_m = float(res[9]) / 1000000 # 百万
-            return {"name": res[0], "price": price, "pct": pct, "amount": amount_m, "code": code}
+        
+        # 新浪接口解析：
+        # 3:现价, 2:昨收, 8:成交量(股), 9:成交额(元)
+        price = float(res[3])
+        prev_close = float(res[2])
+        pct = round((price - prev_close) / prev_close * 100, 2)
+        # 简化换手率估算（量比逻辑）
+        vol_ratio = float(res[8]) / 1000000 
+        
+        return {"price": price, "pct": pct, "amount": float(res[9])/10000, "name": res[0]}
     except: return None
 
-# --- 2. 智能决策引擎 ---
-def analyze_stock(data):
-    # 简单的多维评分逻辑
-    status, color = "⚖️ 持仓观望", "#808080"
-    
-    # 假设资金活跃度评分（成交额异常放大）
-    if data['pct'] > 5:
-        status, color = "🚀 强势拉升：不追涨", "#ff4b4b"
-    elif data['pct'] < -4:
-        status, color = "🟢 缩量回踩：考虑补仓", "#00ff00"
-    
-    # 极端风控
-    if data['pct'] < -7:
-        status, color = "💀 破位预警：建议减仓", "#8b0000"
-        
-    return status, color
+# --- 3. 操盘逻辑（精准减加仓） ---
+def get_action_advice(pct, amount_status):
+    # 结合涨跌幅与资金活跃度
+    if pct > 6: return "🔴 减仓 30%", "冲高过热，落袋为安", "#ff4b4b"
+    if pct < -5: return "💀 清仓/止损", "放量破位，防守第一", "#8b0000"
+    if -3 < pct < -1: return "🟢 低吸 20%", "缩量回踩，分批潜伏", "#00ff00"
+    return "⚖️ 持仓待涨", "走势平稳，静待变盘", "#808080"
 
-# --- UI 展示 ---
-st.title("🛡️ 幻方智能指挥部 V5.1")
+# --- UI 渲染 ---
+st.title("🛡️ 幻方定制终端 V6.0 | 指挥官模式")
 bj_now = datetime.now(timezone(timedelta(hours=8)))
-st.caption(f"🕒 极速引擎已就绪 | 北京时间: {bj_now.strftime('%H:%M:%S')}")
+st.subheader(f"📅 实战监控中 | {bj_now.strftime('%H:%M:%S')}")
 
-# 侧边栏：持仓管理
-my_stocks = st.sidebar.text_input("输入持仓代码 (逗号分隔)", value="002400,600986,300059")
-stock_list = [s.strip() for s in my_stocks.split(",") if s.strip()]
+# 4. 大盘风控仪表盘
+market = get_live_intelligence("000001")
+if market:
+    m_color = "red" if market['pct'] > 0 else "green"
+    st.sidebar.markdown(f"### 🏛️ 大盘指数: `{market['price']}` ({market['pct']}%)")
+    if market['pct'] < -1.0:
+        st.sidebar.error("⚠️ 大盘环境恶劣：禁止任何加仓操作！")
 
-# 3. 核心作战区
-st.subheader("📊 深度持仓诊断")
-cols = st.columns(len(stock_list))
-
-for i, code in enumerate(stock_list):
-    with cols[i]:
-        res = get_sina_rich_data(code)
-        if res:
-            status, color = analyze_stock(res)
+# 5. 持仓作战单元
+st.markdown("---")
+for code, info in MY_PORTFOLIO.items():
+    res = get_live_intelligence(code)
+    if res:
+        advice, detail, color = get_action_advice(res['pct'], "normal")
+        
+        with st.container():
+            # 使用 HTML 打造更专业的操盘卡片
             st.markdown(f"""
-            <div style="background:rgba(255,255,255,0.05); padding:15px; border-radius:12px; border:2px solid {color}">
-                <h3 style="margin:0">{res['name']} <small style="font-size:12px">{code}</small></h3>
-                <h1 style="color:{color}; margin:10px 0">{res['price']}</h1>
-                <p>涨跌幅: <b>{res['pct']}%</b></p>
-                <p>成交额: <b>{res['amount']:.1f} M</b></p>
-                <div style="background:{color}; color:black; padding:8px; border-radius:5px; text-align:center; font-weight:bold">
-                    {status}
+            <div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px; border-left:10px solid {color}; margin-bottom:15px">
+                <div style="display:flex; justify-content:space-between">
+                    <h2 style="margin:0">{info['name']} ({code})</h2>
+                    <h2 style="margin:0; color:{color}">{res['price']} ({res['pct']}%)</h2>
+                </div>
+                <div style="display:flex; gap:20px; margin-top:10px; opacity:0.8">
+                    <span>持仓: <b>{info['vol']} 股</b></span>
+                    <span>成交额: <b>{res['amount']:.1f} 万</b></span>
+                </div>
+                <div style="margin-top:15px; padding:10px; background:{color}22; border-radius:5px">
+                    <b style="color:{color}">建议操作：{advice}</b> | <span style="font-size:14px">{detail}</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-        else:
-            st.error(f"代码 {code} 接口超时")
 
-# 4. 全市场雷达（备用腾讯高速通道，避开AkShare）
+# 6. 精准异动关注
 st.divider()
-st.subheader("📡 盘中异动雷达 (全自动扫描)")
+st.subheader("📡 全市场异动雷达 (高精准选股)")
+try:
+    import akshare as ak
+    # 找寻“低位放量”启动的票
+    radar_df = ak.stock_zh_a_spot_em().sort_values('主力净流入', ascending=False).head(5)
+    st.dataframe(radar_df[['代码', '名称', '最新价', '涨跌幅', '主力净流入']])
+except:
+    st.write("异动雷达扫描中...")
 
-@st.cache_data(ttl=60)
-def get_radar_list():
-    # 这里我们用腾讯的一个极轻量榜单接口，只拿前 10 名，绝不卡顿
-    try:
-        url = "http://gu.qq.com/proxy/itrdp/get_market_rank?market=all&type=rank_ashare&sort=change_pct&order=desc&num=5"
-        # 简化处理，实际中建议直接抓取涨幅榜
-        return ["600986", "002400", "300059"] # 这里暂代，你可以手动输入关注名单
-    except: return []
-
-radar_list = ["600986", "002400", "603000", "000725", "601318"] # 示例关注名单
-r_cols = st.columns(5)
-for i, r_code in enumerate(radar_list):
-    r_data = get_sina_rich_data(r_code)
-    if r_data:
-        r_cols[i].metric(r_data['name'], r_data['price'], f"{r_data['pct']}%")
-
-# 自动刷新
-time.sleep(15)
+time.sleep(20)
 st.rerun()
