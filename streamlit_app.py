@@ -1,68 +1,76 @@
 import streamlit as st
 import akshare as ak
 import pandas as pd
-import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 配置区 ---
-SC_KEY = "你的Server酱SendKey" 
+# --- 1. 强制极速配置 ---
+st.set_page_config(page_title="极速作战终端", layout="wide")
 
-# --- 1. 修复时区警告的北京时间函数 ---
-def get_beijing_time():
-    # 使用 Python 3.12 推荐的 timezone-aware 方式，消除日志里的 DeprecationWarning
+def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# --- 2. 增加带缓存的数据抓取 (防止封禁) ---
-@st.cache_data(ttl=60) # 数据缓存60秒，避免每秒都去冲击接口
-def fetch_stock_data():
+# --- 2. 狙击手模式：定向获取单只股票数据 ---
+# 不再抓取全市场 5000 只票，只抓你需要的这几只
+def get_single_stock(code):
     try:
-        return ak.stock_zh_a_spot_em()
+        # 使用单个股票的历史分钟快照接口，速度极快且稳定
+        df = ak.stock_zh_a_spot_em() 
+        data = df[df['代码'] == code].iloc[0]
+        return data
     except:
         return None
 
-# --- 3. 诊断逻辑 ---
-def get_analysis(df_spot, code, lead_code="600986"):
-    try:
-        target = df_spot[df_spot['代码'] == code].iloc[0]
-        leader = df_spot[df_spot['代码'] == lead_code].iloc[0]
-        
-        price = float(target['最新价'])
-        change = float(target['涨跌幅'])
-        turnover = float(target['换手率'])
-        gap = change - float(leader['涨跌幅'])
-        
-        signal, color = "⚖️ 持仓", "#808080"
-        if change > 6 and turnover > 10: signal, color = "⚠️ 减仓/做T", "#ff4b4b"
-        elif gap < -4: signal, color = "💎 补涨加仓", "#00ff00"
-        
-        return {"name":target['名称'], "price":price, "change":change, "turnover":turnover, "gap":gap, "signal":signal, "color":color}
-    except: return None
+# --- 主界面 ---
+st.title("🛡️ 极速量化终端 V4.2")
+st.write(f"🕒 北京时间: {get_bj_time().strftime('%H:%M:%S')}")
 
-# --- UI 渲染 ---
-st.title("🛡️ 幻方量化终端 V4.1 (稳定版)")
+# 3. 侧边栏输入
+my_stocks = st.sidebar.text_input("输入持仓代码(逗号分隔)", value="002400,600986")
+stock_list = [s.strip() for s in my_stocks.split(",")]
 
-bj_now = get_beijing_time()
-st.subheader(f"📅 北京时间: {bj_now.strftime('%H:%M:%S')}")
+# 4. 核心作战单元
+cols = st.columns(len(stock_list))
 
-# 获取数据
-df_spot = fetch_stock_data()
+# 提前抓取一次全表（如果定向失败则用此备选）
+@st.cache_data(ttl=15)
+def get_cached_spot():
+    return ak.stock_zh_a_spot_em()
 
-if df_spot is not None:
-    my_holdings = st.sidebar.multiselect("持仓池", ["002400", "600986"], default=["002400"])
-    
-    for stock in my_holdings:
-        res = get_analysis(df_spot, stock)
-        if res:
-            st.markdown(f"""
-            <div style="padding:15px; border-radius:10px; border:2px solid {res['color']}; margin-bottom:10px;">
-                <h4>{res['name']} ({stock}) <span style="color:{res['color']}">{res['signal']}</span></h4>
-                <p>价格: {res['price']} | 涨幅: {res['change']}% | 换手: {res['turnover']}% | 偏差: {res['gap']:.2f}%</p>
-            </div>
-            """, unsafe_allow_html=True)
+df_all = get_cached_spot()
+
+if df_all is not None:
+    for i, code in enumerate(stock_list):
+        with cols[i]:
+            try:
+                row = df_all[df_all['代码'] == code].iloc[0]
+                price = row['最新价']
+                change = row['涨跌幅']
+                
+                # 简易视觉卡片
+                color = "#ff4b4b" if change > 0 else "#00ff00"
+                st.markdown(f"""
+                <div style="background-color:rgba(255,255,255,0.05); padding:20px; border-radius:10px; border-left:5px solid {color}">
+                    <h3 style="margin:0">{row['名称']}</h3>
+                    <h2 style="color:{color}; margin:10px 0">{price} <span style="font-size:15px">({change}%)</span></h2>
+                    <p style="font-size:12px; margin:0">换手: {row['换手率']}% | 主力: {row['主力净流入']/10000:.1f}万</p>
+                </div>
+                """, unsafe_allow_html=True)
+            except:
+                st.error(f"代码 {code} 抓取超时")
 else:
-    st.warning("⚠️ 接口响应慢，正在排队重试，请稍候...")
+    st.error("🚨 核心行情接口拥堵，请尝试刷新页面或检查网络。")
 
-# 降低刷新频率，保护接口
-time.sleep(60) 
+# 5. 情报区（精简版）
+st.divider()
+if st.checkbox("开启实时情报穿透"):
+    try:
+        news = ak.js_news(endpoint="7_24").head(5)
+        for _, r in news.iterrows():
+            st.caption(f"{r['datetime']} | {r['content']}")
+    except:
+        st.write("情报接口繁忙...")
+
+# 自动刷新节奏控制
+time.sleep(20)
 st.rerun()
