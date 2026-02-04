@@ -1,96 +1,105 @@
 import streamlit as st
 import akshare as ak
 import pandas as pd
+import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- 核心配置 ---
-st.set_page_config(page_title="幻方级资产管理中枢", layout="wide")
+# --- 【配置区】 ---
+# 去 sct.ftqq.com 获取 SendKey 填在这里
+SC_KEY = "你的Server酱SendKey" 
 
-# --- 风险周期控制 (避雷逻辑) ---
-def get_market_sentiment():
-    curr_month = datetime.now().month
-    curr_day = datetime.now().day
-    
-    # 因子 1: 4月年报雷区
-    if curr_month == 4:
-        return "🔴 避险期：年报披露季，严控垃圾股，谨防业绩杀！", 0.3
-    # 因子 2: 1月/春节前缩量风险
-    if curr_month == 1 or (curr_month == 2 and curr_day < 15):
-        return "🟡 缩量期：春节效应，资金面趋紧，建议轻仓过节。", 0.5
-    # 因子 3: 正常交易期
-    return "🟢 活跃期：大盘环境正常，可执行积极策略。", 1.0
+def send_wechat(title, content):
+    if not SC_KEY or "你的" in SC_KEY: return
+    try:
+        url = f"https://sctapi.ftqq.com/{SC_KEY}.send"
+        data = {"title": title, "desp": content}
+        requests.post(url, data=data, timeout=5)
+    except: pass
 
-# --- 核心计算引擎 ---
-def get_stock_analysis(code, lead_code="600986"):
+# --- 核心页面设置 ---
+st.set_page_config(page_title="幻方实战终端V4", layout="wide")
+
+# --- 核心算法与因子诊断 ---
+def get_advanced_analysis(code, lead_code="600986"):
     try:
         df_spot = ak.stock_zh_a_spot_em()
         target = df_spot[df_spot['代码'] == code].iloc[0]
         leader = df_spot[df_spot['代码'] == lead_code].iloc[0]
         
-        # 提取关键因子
         price = float(target['最新价'])
         change = float(target['涨跌幅'])
         turnover = float(target['换手率'])
         net_money = float(target['主力净流入'])
         gap = change - float(leader['涨跌幅'])
         
-        # 智能诊断逻辑
-        signal = "持仓"
-        if change > 7 and turnover > 12: signal = "减仓/做T"
-        elif change < -5: signal = "止损/清仓"
-        elif gap < -3: signal = "低吸/补仓"
+        # 决策逻辑
+        signal = "⚖️ 持仓观望"
+        color = "#808080" # 灰色
         
+        if change > 6 and turnover > 10:
+            signal = "⚠️ 建议减仓/做T"
+            color = "#ff4b4b" # 红色
+        elif change < -5 or (turnover > 15 and change < 1):
+            signal = "💀 极端风险：清仓"
+            color = "#8b0000" # 深红
+            send_wechat(f"警报：{target['名称']} 触发清仓因子", f"现价:{price}, 换手:{turnover}%")
+        elif gap < -4:
+            signal = "💎 补涨机会：加仓"
+            color = "#00ff00" # 绿色
+            send_wechat(f"机会：{target['名称']} 补涨信号", f"落后龙头{leader['名称']}约 {gap}%")
+
         return {
             "name": target['名称'], "price": price, "change": change,
-            "turnover": turnover, "gap": gap, "net_money": net_money, "signal": signal
+            "turnover": turnover, "gap": gap, "net_money": net_money, 
+            "signal": signal, "color": color
         }
     except: return None
 
-# --- 界面展示 ---
-st.title("🏛️ 幻方级智能资产管理中枢")
+# --- UI 界面渲染 ---
+st.title("🛡️ 幻方级量化实战终端 V4.0")
 
-# 1. 系统性风控看板
-risk_msg, max_pos = get_market_sentiment()
-st.error(f"系统风控：{risk_msg} (当前建议最高总仓位：{max_pos*100}%)")
+# 1. 顶部状态栏
+bj_now = datetime.utcnow() + timedelta(hours=8)
+st.markdown(f"**北京时间：{bj_now.strftime('%Y-%m-%d %H:%M:%S')}** | 市场状态：盘中监控")
 
-# 2. 多标的动态池管理 (3支持仓)
-st.subheader("📊 核心持仓动态监控")
-my_holdings = st.multiselect("当前持仓组合 (最多建议3支)", ["600879", "600977",  "002400"], default=["002400"])
+# 2. 多标的作战单元
+st.sidebar.header("🕹️ 指挥部设置")
+my_holdings = st.sidebar.multiselect("持仓池", ["002400", "600986", "000001", "300059"], default=["002400"])
+target_leader = st.sidebar.text_input("对标龙头代码", value="600986")
 
-cols = st.columns(len(my_holdings))
-for i, stock in enumerate(my_holdings):
-    with cols[i]:
-        res = get_stock_analysis(stock)
-        if res:
-            st.metric(f"{res['name']} ({stock})", f"{res['price']}", f"{res['change']}%")
-            st.write(f"**指令：{res['signal']}**")
-            st.progress(min(res['turnover']/15, 1.0), text=f"换手饱和度 {res['turnover']}%")
-            if "清仓" in res['signal']:
-                st.warning("⚠️ 触发清仓因子，请看下方补位推荐！")
+for stock in my_holdings:
+    res = get_advanced_analysis(stock, target_leader)
+    if res:
+        st.markdown(f"""
+        <div style="padding:15px; border-radius:10px; border:2px solid {res['color']}; margin-bottom:10px; background-color: rgba(255,255,255,0.05)">
+            <h3 style="margin:0">{res['name']} ({stock}) <span style="font-size:18px; color:{res['color']}">{res['signal']}</span></h3>
+            <div style="display:flex; justify-content:space-between; margin-top:10px">
+                <div>最新价: <b>{res['price']}</b></div>
+                <div>涨跌幅: <b>{res['change']}%</b></div>
+                <div>换手率: <b>{res['turnover']}%</b></div>
+                <div>对位偏差: <b>{res['gap']:.2f}%</b></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# 3. 补位选股 (当清仓后需要新血)
+# 3. 信息穿透模块
 st.divider()
-st.subheader("🔄 动态补位：主力抢筹池")
-if st.button("启动资金穿透扫描"):
-    try:
-        flow = ak.stock_individual_fund_flow_rank(indicator="今日")
-        recommend = flow.head(3) # 选出主力最强的前三
-        st.write("若上方持仓股清仓，建议从以下标的择机补充：")
-        st.dataframe(recommend[['代码', '名称', '最新价', '涨跌幅', '今日主力净流入-净额']])
-    except: st.write("非交易时段，请开盘后扫描。")
-
-# 4. 舆情穿透
-with st.expander("📰 7x24小时财经情报"):
+t1, t2 = st.tabs(["📰 实时情报", "💰 补位雷达"])
+with t1:
     try:
         news = ak.js_news(endpoint="7_24").head(5)
-        for _, r in news.iterrows(): st.write(f"{r['datetime']} : {r['content']}")
-    except: st.write("正在连接通讯社...")
+        for _, r in news.iterrows(): st.write(f"[{r['datetime']}] {r['content']}")
+    except: st.write("情报连接中...")
 
-st.caption(f"同步时间: {import datetime
+with t2:
+    if st.button("全市场资金扫描"):
+        try:
+            flow = ak.stock_individual_fund_flow_rank(indicator="今日")
+            st.dataframe(flow.head(8).style.background_gradient(cmap='RdYlGn'))
+        except: st.write("请在交易时段扫描")
 
-# 获取 UTC 时间并强制转换成北京时间 (UTC+8)
-bj_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%H:%M:%S')
-
-# 修改最后的底栏显示
-st.caption(f"同步时间 (北京): {bj_time} | 策略引擎：V4.0 Pro | 云端节点：US-East")} | 策略引擎：V3.0 Pro")
+# 4. 自动刷新频率
+st.caption(f"数据每 30 秒自动同步一次")
+time.sleep(30)
+st.rerun()
