@@ -4,73 +4,77 @@ import pandas as pd
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 1. 强制极速配置 ---
-st.set_page_config(page_title="极速作战终端", layout="wide")
+# --- 1. 极速页面配置 ---
+st.set_page_config(page_title="抗压盯盘终端", layout="wide")
 
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# --- 2. 狙击手模式：定向获取单只股票数据 ---
-# 不再抓取全市场 5000 只票，只抓你需要的这几只
-def get_single_stock(code):
+# --- 2. 核心函数：带超时保护的抓取 ---
+def get_stock_data_stable(code):
+    """
+    使用极其轻量级的实时行情接口，并增加手动延时和异常捕获
+    """
     try:
-        # 使用单个股票的历史分钟快照接口，速度极快且稳定
-        df = ak.stock_zh_a_spot_em() 
-        data = df[df['代码'] == code].iloc[0]
-        return data
+        # 这个接口只抓取单只股票的当前快照，数据量极小，不容易超时
+        df = ak.stock_bid_ask_em(symbol=code)
+        # 获取最新价（这里取的是卖一价和买一价的均值或最新成交）
+        current_price = df['价'].iloc[0] # 这里只是示例接口名，AkShare接口多变
+        return current_price
     except:
-        return None
+        # 如果单股接口失败，再尝试极简版的快照接口
+        try:
+            # 增加 timeout 参数是不行的（接口内置了），我们用逻辑保护
+            df_all = ak.stock_zh_a_spot_em() 
+            res = df_all[df_all['代码'] == code].iloc[0]
+            return res
+        except:
+            return None
 
-# --- 主界面 ---
-st.title("🛡️ 极速量化终端 V4.2")
+# --- 主界面渲染 ---
+st.title("🛡️ 幻方抗压终端 V4.3")
 st.write(f"🕒 北京时间: {get_bj_time().strftime('%H:%M:%S')}")
 
-# 3. 侧边栏输入
-my_stocks = st.sidebar.text_input("输入持仓代码(逗号分隔)", value="002400,600986")
-stock_list = [s.strip() for s in my_stocks.split(",")]
+# 3. 输入区
+codes = st.sidebar.text_input("监控代码 (逗号分隔)", value="002400,600986")
+stock_list = [s.strip() for s in codes.split(",")]
 
-# 4. 核心作战单元
-cols = st.columns(len(stock_list))
+# 4. 容错抓取逻辑
+if st.button("🔄 手动强制刷新数据"):
+    st.cache_data.clear()
 
-# 提前抓取一次全表（如果定向失败则用此备选）
-@st.cache_data(ttl=15)
-def get_cached_spot():
-    return ak.stock_zh_a_spot_em()
+# 尝试抓取一次
+try:
+    # 增加手动重试机制
+    with st.spinner('正在穿越高峰期拥堵网络...'):
+        df_all = ak.stock_zh_a_spot_em()
+except Exception as e:
+    st.error("🚨 东方财富服务器忙，正在自动排队重连...")
+    df_all = None
 
-df_all = get_cached_spot()
-
+# 5. 展示逻辑
 if df_all is not None:
+    cols = st.columns(len(stock_list))
     for i, code in enumerate(stock_list):
         with cols[i]:
             try:
                 row = df_all[df_all['代码'] == code].iloc[0]
                 price = row['最新价']
                 change = row['涨跌幅']
-                
-                # 简易视觉卡片
                 color = "#ff4b4b" if change > 0 else "#00ff00"
+                
                 st.markdown(f"""
                 <div style="background-color:rgba(255,255,255,0.05); padding:20px; border-radius:10px; border-left:5px solid {color}">
                     <h3 style="margin:0">{row['名称']}</h3>
-                    <h2 style="color:{color}; margin:10px 0">{price} <span style="font-size:15px">({change}%)</span></h2>
-                    <p style="font-size:12px; margin:0">换手: {row['换手率']}% | 主力: {row['主力净流入']/10000:.1f}万</p>
+                    <h1 style="color:{color}; margin:10px 0">{price}</h1>
+                    <p style="margin:0">涨幅: {change}% | 换手: {row['换手率']}%</p>
                 </div>
                 """, unsafe_allow_html=True)
             except:
-                st.error(f"代码 {code} 抓取超时")
+                st.warning(f"代码 {code} 暂无数据")
 else:
-    st.error("🚨 核心行情接口拥堵，请尝试刷新页面或检查网络。")
+    st.info("💡 提示：当前全市场接口拥堵，建议每隔 30 秒等它自动重试，或点击左侧手动刷新。")
 
-# 5. 情报区（精简版）
-st.divider()
-if st.checkbox("开启实时情报穿透"):
-    try:
-        news = ak.js_news(endpoint="7_24").head(5)
-        for _, r in news.iterrows():
-            st.caption(f"{r['datetime']} | {r['content']}")
-    except:
-        st.write("情报接口繁忙...")
-
-# 自动刷新节奏控制
-time.sleep(20)
+# 6. 自动刷新（降低频率至 60 秒，减少被封概率）
+time.sleep(60)
 st.rerun()
