@@ -1,80 +1,68 @@
 import streamlit as st
-import akshare as ak
 import pandas as pd
+import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 1. 极速页面配置 ---
-st.set_page_config(page_title="抗压盯盘终端", layout="wide")
+st.set_page_config(page_title="抗压备份终端", layout="wide")
 
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# --- 2. 核心函数：带超时保护的抓取 ---
-def get_stock_data_stable(code):
+# --- 🚀 核心：腾讯财经备用接口 (极速且不易超时) ---
+def get_tencent_price(code):
     """
-    使用极其轻量级的实时行情接口，并增加手动延时和异常捕获
+    腾讯财经接口示例: http://qt.gtimg.cn/q=s_sz002400
+    这个接口非常轻量，不容易被封。
     """
     try:
-        # 这个接口只抓取单只股票的当前快照，数据量极小，不容易超时
-        df = ak.stock_bid_ask_em(symbol=code)
-        # 获取最新价（这里取的是卖一价和买一价的均值或最新成交）
-        current_price = df['价'].iloc[0] # 这里只是示例接口名，AkShare接口多变
-        return current_price
+        # 判断沪深代码前缀
+        prefix = "sh" if code.startswith("6") else "sz"
+        url = f"http://qt.gtimg.cn/q=s_{prefix}{code}"
+        # 增加手动超时控制为 5 秒
+        r = requests.get(url, timeout=5)
+        data = r.text.split('~')
+        if len(data) > 3:
+            return {
+                "name": data[1],
+                "price": data[3],
+                "change": data[4],
+                "change_pct": data[5]
+            }
     except:
-        # 如果单股接口失败，再尝试极简版的快照接口
-        try:
-            # 增加 timeout 参数是不行的（接口内置了），我们用逻辑保护
-            df_all = ak.stock_zh_a_spot_em() 
-            res = df_all[df_all['代码'] == code].iloc[0]
-            return res
-        except:
-            return None
+        return None
 
-# --- 主界面渲染 ---
-st.title("🛡️ 幻方抗压终端 V4.3")
+# --- UI 渲染 ---
+st.title("🛡️ 幻方抗压终端 V4.4 (备用通道)")
 st.write(f"🕒 北京时间: {get_bj_time().strftime('%H:%M:%S')}")
 
-# 3. 输入区
-codes = st.sidebar.text_input("监控代码 (逗号分隔)", value="002400,600986")
-stock_list = [s.strip() for s in codes.split(",")]
+# 输入区
+codes_input = st.sidebar.text_input("监控代码", value="002400,600986")
+stock_list = [s.strip() for s in codes_input.split(",")]
 
-# 4. 容错抓取逻辑
-if st.button("🔄 手动强制刷新数据"):
-    st.cache_data.clear()
+st.subheader("📡 实时盯盘 (腾讯备用引擎)")
 
-# 尝试抓取一次
-try:
-    # 增加手动重试机制
-    with st.spinner('正在穿越高峰期拥堵网络...'):
-        df_all = ak.stock_zh_a_spot_em()
-except Exception as e:
-    st.error("🚨 东方财富服务器忙，正在自动排队重连...")
-    df_all = None
+# 遍历抓取
+cols = st.columns(len(stock_list))
+for i, code in enumerate(stock_list):
+    with cols[i]:
+        # 优先使用备用轻量接口
+        res = get_tencent_price(code)
+        
+        if res:
+            pct = float(res['change_pct'])
+            color = "#ff4b4b" if pct > 0 else "#00ff00"
+            st.markdown(f"""
+            <div style="background-color:rgba(255,255,255,0.05); padding:20px; border-radius:10px; border-top:5px solid {color}">
+                <h3 style="margin:0">{res['name']}</h3>
+                <h1 style="color:{color}; margin:10px 0">{res['price']}</h1>
+                <p style="margin:0">涨跌: {res['change_pct']}%</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.error(f"❌ 代码 {code} 连接失败")
 
-# 5. 展示逻辑
-if df_all is not None:
-    cols = st.columns(len(stock_list))
-    for i, code in enumerate(stock_list):
-        with cols[i]:
-            try:
-                row = df_all[df_all['代码'] == code].iloc[0]
-                price = row['最新价']
-                change = row['涨跌幅']
-                color = "#ff4b4b" if change > 0 else "#00ff00"
-                
-                st.markdown(f"""
-                <div style="background-color:rgba(255,255,255,0.05); padding:20px; border-radius:10px; border-left:5px solid {color}">
-                    <h3 style="margin:0">{row['名称']}</h3>
-                    <h1 style="color:{color}; margin:10px 0">{price}</h1>
-                    <p style="margin:0">涨幅: {change}% | 换手: {row['换手率']}%</p>
-                </div>
-                """, unsafe_allow_html=True)
-            except:
-                st.warning(f"代码 {code} 暂无数据")
-else:
-    st.info("💡 提示：当前全市场接口拥堵，建议每隔 30 秒等它自动重试，或点击左侧手动刷新。")
-
-# 6. 自动刷新（降低频率至 60 秒，减少被封概率）
-time.sleep(60)
+# 自动刷新节奏
+st.info("💡 提示：此版本使用腾讯轻量接口，若仍然连接失败，请检查 GitHub 代码是否正确 Commit。")
+time.sleep(30)
 st.rerun()
