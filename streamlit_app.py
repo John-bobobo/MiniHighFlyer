@@ -2,118 +2,89 @@ import streamlit as st
 import akshare as ak
 import pandas as pd
 import time
+from datetime import datetime
 
-# --- 页面配置 ---
-st.set_page_config(page_title="袖珍幻方-作战指挥部", layout="wide")
+# --- 核心配置 ---
+st.set_page_config(page_title="幻方级资产管理中枢", layout="wide")
 
-# --- 核心算法函数 ---
-@st.cache_data(ttl=30)
-def get_market_data(code, lead_code):
+# --- 风险周期控制 (避雷逻辑) ---
+def get_market_sentiment():
+    curr_month = datetime.now().month
+    curr_day = datetime.now().day
+    
+    # 因子 1: 4月年报雷区
+    if curr_month == 4:
+        return "🔴 避险期：年报披露季，严控垃圾股，谨防业绩杀！", 0.3
+    # 因子 2: 1月/春节前缩量风险
+    if curr_month == 1 or (curr_month == 2 and curr_day < 15):
+        return "🟡 缩量期：春节效应，资金面趋紧，建议轻仓过节。", 0.5
+    # 因子 3: 正常交易期
+    return "🟢 活跃期：大盘环境正常，可执行积极策略。", 1.0
+
+# --- 核心计算引擎 ---
+def get_stock_analysis(code, lead_code="600986"):
     try:
-        # 1. 抓取全市场快照
         df_spot = ak.stock_zh_a_spot_em()
         target = df_spot[df_spot['代码'] == code].iloc[0]
         leader = df_spot[df_spot['代码'] == lead_code].iloc[0]
         
-        # 2. 计算高级因子数据
+        # 提取关键因子
         price = float(target['最新价'])
         change = float(target['涨跌幅'])
         turnover = float(target['换手率'])
-        # 处理主力净流入（部分接口可能返回字符串，需转换）
-        try:
-            net_money = float(target['主力净流入'])
-        except:
-            net_money = 0
-        
-        # 因子B：相关性偏离度 (省广 vs 浙文)
+        net_money = float(target['主力净流入'])
         gap = change - float(leader['涨跌幅'])
         
-        return {
-            "name": target['名称'],
-            "price": price,
-            "change": change,
-            "turnover": turnover,
-            "gap": gap,
-            "net_money": net_money,
-            "leader_name": leader['名称']
-        }
-    except Exception as e:
-        return None
-
-@st.cache_data(ttl=60)
-def get_financial_news():
-    try:
-        return ak.js_news(endpoint="7_24").head(10)
-    except:
-        return pd.DataFrame()
-
-# --- 侧边栏：参数设定 ---
-st.sidebar.header("⚙️ 因子参数设置")
-target_code = st.sidebar.text_input("监控目标", value="002400")
-lead_code = st.sidebar.text_input("联动龙头", value="600986")
-support_line = st.sidebar.number_input("黄金支撑位", value=12.26)
-
-# --- 主界面布局 ---
-st.title("🛡️ 幻方级智能作战指挥中心")
-
-# 第一部分：实时因子监测
-st.subheader("📊 实时因子仪表盘")
-data = get_market_data(target_code, lead_code)
-
-if data:
-    # 顶部指标栏
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("最新价", f"{data['price']} 元", f"{data['change']}%")
-    col2.metric("联动偏离度", f"{data['gap']:.2f}%", help="监控补涨与回落风险")
-    col3.metric("分时换手", f"{data['turnover']}%")
-    col4.metric("主力净流", f"{data['net_money']/10000:.1f} 万")
-
-    # 智能决策逻辑 (因子驱动)
-    st.divider()
-    st.subheader("🎯 因子决策建议")
-    d_col1, d_col2 = st.columns(2)
-    
-    with d_col1:
-        # 逻辑判断：支撑位监控
-        if data['price'] >= support_line:
-            st.success(f"🟢 [趋势] 处于支撑位 {support_line} 之上，属于安全区。")
-        else:
-            st.error(f"🔴 [风险] 已跌破支撑位 {support_line}，考虑执行防守减仓。")
-            
-        # 因子B：补涨博弈
-        if data['gap'] < -3:
-            st.info(f"🔥 [因子B] 提示补涨：龙头 {data['leader_name']} 已先行，目标标的有补涨预期。")
-
-    with d_col2:
-        # 因子A：动量饱和
-        if data['turnover'] > 10:
-            st.warning("⚠️ [因子A] 换手激增：当前波动剧烈，谨防主力高位对倒出货。")
+        # 智能诊断逻辑
+        signal = "持仓"
+        if change > 7 and turnover > 12: signal = "减仓/做T"
+        elif change < -5: signal = "止损/清仓"
+        elif gap < -3: signal = "低吸/补仓"
         
-        # 因子C：博弈逻辑
-        if data['net_money'] > 10000000 and data['change'] < 2:
-            st.success("💎 [因子C] 黄金坑：大单资金吸筹，股价受压制未动，建议关注。")
+        return {
+            "name": target['名称'], "price": price, "change": change,
+            "turnover": turnover, "gap": gap, "net_money": net_money, "signal": signal
+        }
+    except: return None
 
-else:
-    st.info("⏳ 等待开盘信号流入中... (目前处于非交易时段，仅显示离线框架)")
+# --- 界面展示 ---
+st.title("🏛️ 幻方级智能资产管理中枢")
 
-# 第二部分：多维信息穿透
+# 1. 系统性风控看板
+risk_msg, max_pos = get_market_sentiment()
+st.error(f"系统风控：{risk_msg} (当前建议最高总仓位：{max_pos*100}%)")
+
+# 2. 多标的动态池管理 (3支持仓)
+st.subheader("📊 核心持仓动态监控")
+my_holdings = st.multiselect("当前持仓组合 (最多建议3支)", ["002400", "600986", "000001", "300059"], default=["002400"])
+
+cols = st.columns(len(my_holdings))
+for i, stock in enumerate(my_holdings):
+    with cols[i]:
+        res = get_stock_analysis(stock)
+        if res:
+            st.metric(f"{res['name']} ({stock})", f"{res['price']}", f"{res['change']}%")
+            st.write(f"**指令：{res['signal']}**")
+            st.progress(min(res['turnover']/15, 1.0), text=f"换手饱和度 {res['turnover']}%")
+            if "清仓" in res['signal']:
+                st.warning("⚠️ 触发清仓因子，请看下方补位推荐！")
+
+# 3. 补位选股 (当清仓后需要新血)
 st.divider()
-tab1, tab2 = st.tabs(["📰 全网7x24快讯", "💰 全市场资金流向"])
+st.subheader("🔄 动态补位：主力抢筹池")
+if st.button("启动资金穿透扫描"):
+    try:
+        flow = ak.stock_individual_fund_flow_rank(indicator="今日")
+        recommend = flow.head(3) # 选出主力最强的前三
+        st.write("若上方持仓股清仓，建议从以下标的择机补充：")
+        st.dataframe(recommend[['代码', '名称', '最新价', '涨跌幅', '今日主力净流入-净额']])
+    except: st.write("非交易时段，请开盘后扫描。")
 
-with tab1:
-    news = get_financial_news()
-    if not news.empty:
-        for _, row in news.iterrows():
-            st.write(f"**{row['datetime']}** : {row['content']}")
-    else:
-        st.write("正在穿透新闻网络...")
+# 4. 舆情穿透
+with st.expander("📰 7x24小时财经情报"):
+    try:
+        news = ak.js_news(endpoint="7_24").head(5)
+        for _, r in news.iterrows(): st.write(f"{r['datetime']} : {r['content']}")
+    except: st.write("正在连接通讯社...")
 
-with tab2:
-    if st.button("开启全市场扫描"):
-        try:
-            flow = ak.stock_individual_fund_flow_rank(indicator="今日")
-            st.dataframe(flow.head(10)[['代码', '名称', '最新价', '今日主力净流入-净额']])
-        except:
-            st.write("接口维护中，请于交易时段重试。")
-
-st.caption(f"最后同步: {time.strftime('%H:%M:%S')} | 云端量化引擎已就绪")
+st.caption(f"同步时间: {time.strftime('%H:%M:%S')} | 策略引擎：V3.0 Pro")
