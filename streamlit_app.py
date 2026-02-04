@@ -87,4 +87,10 @@ with st.expander("📰 7x24小时财经情报"):
         for _, r in news.iterrows(): st.write(f"{r['datetime']} : {r['content']}")
     except: st.write("正在连接通讯社...")
 
-st.caption(f"同步时间: {time.strftime('%H:%M:%S')} | 策略引擎：V3.0 Pro")
+st.caption(f"同步时间: {import datetime
+
+# 获取 UTC 时间并强制转换成北京时间 (UTC+8)
+bj_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%H:%M:%S')
+
+# 修改最后的底栏显示
+st.caption(f"同步时间 (北京): {bj_time} | 策略引擎：V4.0 Pro | 云端节点：US-East")} | 策略引擎：V3.0 Pro")
