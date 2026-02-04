@@ -13,7 +13,7 @@ MY_PORTFOLIO = {
     "000759": {"name": "中百集团", "vol": 10000, "float_shares": 6.8e8},
     "600977": {"name": "中国电影", "vol": 3100, "float_shares": 18.6e8},
     "002400": {"name": "省广集团", "vol": 2700, "float_shares": 17.4e8},
-    "600893": {"name": "航发动力", "vol": 900, "float_shares": 26.6e8}
+    "000547": {"name": "航天发展", "vol": 900, "float_shares": 26.6e8}
 }
 
 # --- 2. 核心：深度行情引擎 ---
