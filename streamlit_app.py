@@ -1,13 +1,35 @@
 import streamlit as st
 import pandas as pd
+import akshare as ak
 import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 1. 初始化设置与状态管理 ---
-st.set_page_config(page_title="幻方全功能终端V8.0", layout="wide")
+st.set_page_config(page_title="幻方分时作战终端V9.0", layout="wide")
 
-# 初始化持仓数据，如果 session 中没有，则加载默认值
+# --- 1. 获取今日分时数据（赋予曲线波动性） ---
+def get_minute_chart(code):
+    try:
+        # 获取分时数据，AkShare 接口获取今日从 9:30 开始的所有数据
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period='1', adjust='', start_date="2026-02-04 09:30:00")
+        if not df.empty:
+            df = df.rename(columns={'时间': 'time', '收盘': 'price'})
+            return df[['time', 'price']]
+    except:
+        return pd.DataFrame()
+
+# --- 2. 资金流向 & 全球动态 ---
+def get_global_money_flow():
+    try:
+        # 获取北向资金实时数据（代表全球资金对 A 股的态度）
+        hsgt_df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+        # 获取主力净流入排名
+        main_flow = ak.stock_individual_fund_flow_rank().head(5)
+        return hsgt_df, main_flow
+    except:
+        return None, None
+
+# --- 3. 动态配置区 ---
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = {
         "600879": {"name": "航天电子", "vol": 3800, "float": 32.7e8},
@@ -17,104 +39,57 @@ if 'portfolio' not in st.session_state:
         "600893": {"name": "航发动力", "vol": 900, "float": 26.6e8}
     }
 
-if 'price_history' not in st.session_state:
-    st.session_state.price_history = {} # 存储分时数据点
+# --- UI 渲染 ---
+st.title("🛡️ 幻方 V9.0 | 分时曲线与资金流向")
+bj_now = datetime.now(timezone(timedelta(hours=8)))
+st.caption(f"📅 盘中实战模式 | 北京时间: {bj_now.strftime('%H:%M:%S')}")
 
-# --- 2. 核心数据引擎 ---
-def get_pro_data(code):
-    try:
-        prefix = "sh" if code.startswith("6") else "sz"
-        url = f"https://hq.sinajs.cn/list={prefix}{code}"
-        headers = {'Referer': 'http://finance.sina.com.cn'}
-        r = requests.get(url, headers=headers, timeout=3)
-        res = r.text.split('"')[1].split(',')
-        price = float(res[3])
-        prev_close = float(res[2])
-        return {
-            "name": res[0], "price": price, 
-            "pct": round((price - prev_close) / prev_close * 100, 2),
-            "vol": float(res[8]), "amount": float(res[9])
-        }
-    except: return None
+# 第一部分：全球资金与主力异动（这一块是更新最快的）
+st.subheader("🌐 全球资金流向 & 主力异动")
+money_col1, money_col2 = st.columns([1, 2])
 
-# --- 3. 动态配置区（侧边栏增删改） ---
-with st.sidebar:
-    st.header("⚙️ 战队配置中心")
-    
-    # 添加个股
-    with st.expander("➕ 新增监控个股"):
-        new_code = st.text_input("代码", key="add_code")
-        new_name = st.text_input("简称", key="add_name")
-        new_vol = st.number_input("持仓数", value=0)
-        if st.button("确认添加"):
-            st.session_state.portfolio[new_code] = {"name": new_name, "vol": new_vol, "float": 10e8}
-            st.rerun()
+hsgt, main_flow = get_global_money_flow()
+with money_col1:
+    if hsgt is not None:
+        net_in = hsgt.iloc[-1]['value'] / 10000 # 亿
+        st.metric("外资(北向)净流入", f"{net_in:.2f} 亿", delta=f"{net_in:.2f}")
+    else:
+        st.write("资金数据获取中...")
 
-    # 删除/修改持仓
-    st.write("🗑️ 持仓管理")
-    for code in list(st.session_state.portfolio.keys()):
-        cols = st.columns([2, 1])
-        new_v = cols[0].number_input(f"{st.session_state.portfolio[code]['name']}", value=st.session_state.portfolio[code]['vol'], key=f"v_{code}")
-        st.session_state.portfolio[code]['vol'] = new_v
-        if cols[1].button("❌", key=f"del_{code}"):
-            del st.session_state.portfolio[code]
-            st.rerun()
+with money_col2:
+    if main_flow is not None:
+        st.caption("🔥 实时主力净流入 Top 5")
+        st.dataframe(main_flow[['代码', '名称', '最新价', '今日主力净流入额']], hide_index=True)
 
-# --- 4. 主界面：实时看盘与决策 ---
-st.title("🛡️ 幻方 V8.0 实战指挥系统")
-bj_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
-st.caption(f"状态：作战中 | 最后更新：{bj_time}")
-
-# 遍历持仓展示
+# 第二部分：持仓深度分时看盘
+st.divider()
 for code, info in st.session_state.portfolio.items():
-    data = get_pro_data(code)
-    if data:
-        # 更新价格历史（用于画曲线）
-        if code not in st.session_state.price_history:
-            st.session_state.price_history[code] = []
-        st.session_state.price_history[code].append(data['price'])
-        if len(st.session_state.price_history[code]) > 50: # 只保留最近50个点
-            st.session_state.price_history[code].pop(0)
-
-        # 逻辑计算
-        turnover = round((data['vol'] / info['float']) * 100, 4) if 'float' in info else 0
+    chart_df = get_minute_chart(code)
+    
+    if not chart_df.empty:
+        curr_price = chart_df.iloc[-1]['price']
+        prev_close = chart_df.iloc[0]['price'] # 简单处理以开盘价对标波动
+        pct = round((curr_price - prev_close) / prev_close * 100, 2)
         
-        # 决策模块
-        advice, reason, color = "⚖️ 持仓待变", "盘面波动处于正常区间", "#808080"
-        if data['pct'] > 7:
-            advice, reason, color = "🔴 减仓 30%", "原因：触发高位乖离阈值，保护利润，防止炸板回落。", "#ff4b4b"
-        elif data['pct'] < -5:
-            advice, reason, color = "💀 紧急清仓", "原因：跌破核心支撑位，资金大幅流出，规避系统性风险。", "#ff0000"
-        elif data['pct'] < -2 and turnover < 2:
-            advice, reason, color = "🟢 补仓 10%", "原因：缩量回踩，龙头未崩，属于良性调整，摊薄成本。", "#00ff00"
+        # 赋予具体的波动决策
+        advice, color = "⚖️ 观望", "#808080"
+        if pct > 4: advice, color = "🔴 建议减仓 (分时冲高)", "#ff4b4b"
+        elif pct < -3: advice, color = "🟢 建议补仓 (缩量回踩)", "#00ff00"
 
-        # 渲染卡片
         with st.container():
-            col_info, col_chart = st.columns([1, 2])
-            
-            with col_info:
+            col_txt, col_graph = st.columns([1, 3])
+            with col_txt:
                 st.markdown(f"""
-                <div style="background:rgba(255,255,255,0.05); padding:15px; border-radius:10px; border-left:8px solid {color}">
-                    <h3>{data['name']} <small>{code}</small></h3>
-                    <h1 style="color:{color}">{data['price']} <span style="font-size:18px">({data['pct']}%)</span></h1>
-                    <p>持仓：{info['vol']} 股</p>
-                    <div style="background:{color}33; padding:10px; border-radius:5px">
-                        <b>指令：{advice}</b><br><small>{reason}</small>
-                    </div>
+                <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left:5px solid {color}">
+                    <h4>{info['name']}</h4>
+                    <h2 style="color:{color}">{curr_price}</h2>
+                    <p>今日涨幅: {pct}%</p>
+                    <p style="font-weight:bold; color:{color}">指令: {advice}</p>
                 </div>
                 """, unsafe_allow_html=True)
-            
-            with col_chart:
-                # 绘制实时价格曲线
-                chart_data = pd.DataFrame(st.session_state.price_history[code], columns=['Price'])
-                st.line_chart(chart_data, height=180, use_container_width=True)
-
-# --- 5. 异动扫描雷达 ---
-st.divider()
-st.subheader("📡 全球资金流向 & 异动扫描")
-# 这里可以手动添加一些观察个股
-st.info("提示：若发现板块内有3只以上个股涨停，建议加大对标龙头的关注度。")
+            with col_graph:
+                st.line_chart(chart_df.set_index('time'), height=200)
 
 # 自动刷新
-time.sleep(10) # 曲线模式建议刷新快一点
+time.sleep(30)
 st.rerun()
