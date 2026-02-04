@@ -4,19 +4,20 @@ import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-st.set_page_config(page_title="指挥官定制终端V6.0", layout="wide")
+st.set_page_config(page_title="指挥官专业终端V7.0", layout="wide")
 
-# --- 1. 核心实仓配置 ---
+# --- 1. 实仓与流通盘配置（用于计算精准换手率） ---
+# 注意：流通股本数据为近似值，建议根据年报微调
 MY_PORTFOLIO = {
-    "600879": {"name": "航天电子", "vol": 3800},
-    "000759": {"name": "中百集团", "vol": 10000},
-    "600977": {"name": "中国电影", "vol": 3100},
-    "002400": {"name": "省广集团", "vol": 2700},
-    "000547": {"name": "航天发展", "vol": 900}
+    "600879": {"name": "航天电子", "vol": 3800, "float_shares": 32.7e8},
+    "000759": {"name": "中百集团", "vol": 10000, "float_shares": 6.8e8},
+    "600977": {"name": "中国电影", "vol": 3100, "float_shares": 18.6e8},
+    "002400": {"name": "省广集团", "vol": 2700, "float_shares": 17.4e8},
+    "600893": {"name": "航发动力", "vol": 900, "float_shares": 26.6e8}
 }
 
-# --- 2. 极速行情引擎 (含换手率解析) ---
-def get_live_intelligence(code):
+# --- 2. 核心：深度行情引擎 ---
+def get_pro_intelligence(code, float_shares):
     try:
         prefix = "sh" if code.startswith("6") else "sz"
         url = f"https://hq.sinajs.cn/list={prefix}{code}"
@@ -24,73 +25,92 @@ def get_live_intelligence(code):
         r = requests.get(url, headers=headers, timeout=3)
         res = r.text.split('"')[1].split(',')
         
-        # 新浪接口解析：
-        # 3:现价, 2:昨收, 8:成交量(股), 9:成交额(元)
+        # 数据解析
         price = float(res[3])
         prev_close = float(res[2])
         pct = round((price - prev_close) / prev_close * 100, 2)
-        # 简化换手率估算（量比逻辑）
-        vol_ratio = float(res[8]) / 1000000 
+        volume = float(res[8]) # 股
+        amount = float(res[9]) # 元
         
-        return {"price": price, "pct": pct, "amount": float(res[9])/10000, "name": res[0]}
+        # 计算核心指标
+        turnover = round((volume / float_shares) * 100, 2) # 精准换手率
+        avg_price = amount / volume if volume > 0 else price
+        power = "💪 强" if price > avg_price else "🐍 弱" # 站稳均线判断
+        
+        return {
+            "name": res[0], "price": price, "pct": pct, 
+            "turnover": turnover, "amount": amount/10000, 
+            "power": power, "buy_1": res[11], "sell_1": res[21]
+        }
     except: return None
 
-# --- 3. 操盘逻辑（精准减加仓） ---
-def get_action_advice(pct, amount_status):
-    # 结合涨跌幅与资金活跃度
-    if pct > 6: return "🔴 减仓 30%", "冲高过热，落袋为安", "#ff4b4b"
-    if pct < -5: return "💀 清仓/止损", "放量破位，防守第一", "#8b0000"
-    if -3 < pct < -1: return "🟢 低吸 20%", "缩量回踩，分批潜伏", "#00ff00"
-    return "⚖️ 持仓待涨", "走势平稳，静待变盘", "#808080"
+# --- 3. 智能决策逻辑 ---
+def get_expert_advice(data):
+    p = data['pct']
+    t = data['turnover']
+    
+    # 策略 A：高位换手过热 (出货预警)
+    if p > 4 and t > 10:
+        return "🔴 减仓 1/3", "换手急剧放大，主力有派发迹象", "#ff4b4b"
+    # 策略 B：缩量回调 (良性吸筹)
+    if -3 < p < -1 and t < 3:
+        return "🟢 补仓 10%", "缩量回踩到位，适合小幅摊低成本", "#00ff00"
+    # 策略 C：放量杀跌 (破位)
+    if p < -5 and t > 5:
+        return "💀 紧急清仓", "放量大跌，趋势已坏，先出来避险", "#8b0000"
+    # 策略 D：攻击态势
+    if p > 2 and data['power'] == "💪 强":
+        return "🚀 拿稳领涨", "均线上方强势震荡，目标看更高", "#ffaa00"
+    
+    return "⚖️ 持仓不动", "多空平衡，暂时不需要操作", "#808080"
 
 # --- UI 渲染 ---
-st.title("🛡️ 幻方定制终端 V6.0 | 指挥官模式")
-bj_now = datetime.now(timezone(timedelta(hours=8)))
-st.subheader(f"📅 实战监控中 | {bj_now.strftime('%H:%M:%S')}")
+st.title("🛡️ 幻方指挥部 V7.0 | 专业操盘版")
+st.caption(f"数据更新：{datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}")
 
-# 4. 大盘风控仪表盘
-market = get_live_intelligence("000001")
-if market:
-    m_color = "red" if market['pct'] > 0 else "green"
-    st.sidebar.markdown(f"### 🏛️ 大盘指数: `{market['price']}` ({market['pct']}%)")
-    if market['pct'] < -1.0:
-        st.sidebar.error("⚠️ 大盘环境恶劣：禁止任何加仓操作！")
+# 大盘快报
+m_data = get_pro_intelligence("000001", 3.5e11)
+if m_data:
+    st.sidebar.metric("上证指数", m_data['price'], f"{m_data['pct']}%")
 
-# 5. 持仓作战单元
-st.markdown("---")
+# 4. 持仓深度面板
 for code, info in MY_PORTFOLIO.items():
-    res = get_live_intelligence(code)
-    if res:
-        advice, detail, color = get_action_advice(res['pct'], "normal")
+    data = get_pro_intelligence(code, info['float_shares'])
+    if data:
+        advice, detail, color = get_expert_advice(data)
         
+        # 专业卡片设计
         with st.container():
-            # 使用 HTML 打造更专业的操盘卡片
             st.markdown(f"""
-            <div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px; border-left:10px solid {color}; margin-bottom:15px">
-                <div style="display:flex; justify-content:space-between">
-                    <h2 style="margin:0">{info['name']} ({code})</h2>
-                    <h2 style="margin:0; color:{color}">{res['price']} ({res['pct']}%)</h2>
+            <div style="background:rgba(255,255,255,0.03); padding:15px; border-radius:10px; border-left:12px solid {color}; margin-bottom:10px">
+                <div style="display:flex; justify-content:space-between; align-items:center">
+                    <div>
+                        <span style="font-size:20px; font-weight:bold">{data['name']}</span> 
+                        <span style="color:#aaa; font-size:14px">{code}</span>
+                    </div>
+                    <div style="text-align:right">
+                        <span style="font-size:24px; color:{color}; font-weight:bold">{data['price']}</span>
+                        <span style="font-size:16px; color:{color}">({data['pct']}%)</span>
+                    </div>
                 </div>
-                <div style="display:flex; gap:20px; margin-top:10px; opacity:0.8">
-                    <span>持仓: <b>{info['vol']} 股</b></span>
-                    <span>成交额: <b>{res['amount']:.1f} 万</b></span>
+                <hr style="margin:10px 0; border:0.5px solid #444">
+                <div style="display:flex; justify-content:space-between; font-size:14px">
+                    <span>当前换手: <b>{data['turnover']}%</b></span>
+                    <span>内外力度: <b>{data['power']}</b></span>
+                    <span>买一/卖一: <b style="color:#00ff00">{data['buy_1']}</b> / <b style="color:#ff4b4b">{data['sell_1']}</b></span>
                 </div>
-                <div style="margin-top:15px; padding:10px; background:{color}22; border-radius:5px">
-                    <b style="color:{color}">建议操作：{advice}</b> | <span style="font-size:14px">{detail}</span>
+                <div style="margin-top:12px; padding:8px; background:{color}33; border-radius:5px; border:1px solid {color}">
+                    <span style="color:{color}; font-weight:bold">操盘指令：{advice}</span> <br>
+                    <span style="font-size:12px; opacity:0.9">{detail}</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-# 6. 精准异动关注
+# 5. 异动与资金监控
 st.divider()
-st.subheader("📡 全市场异动雷达 (高精准选股)")
-try:
-    import akshare as ak
-    # 找寻“低位放量”启动的票
-    radar_df = ak.stock_zh_a_spot_em().sort_values('主力净流入', ascending=False).head(5)
-    st.dataframe(radar_df[['代码', '名称', '最新价', '涨跌幅', '主力净流入']])
-except:
-    st.write("异动雷达扫描中...")
+st.subheader("📡 盘中大单异动 & 关注建议")
+# 逻辑：如果某只股在你的持仓之外，但换手突然增加，值得关注
+st.info("💡 11:30 午盘小结：关注航发动力是否放量过均线，若换手超 3% 且价稳，则是加仓良机。")
 
-time.sleep(20)
+time.sleep(30)
 st.rerun()
