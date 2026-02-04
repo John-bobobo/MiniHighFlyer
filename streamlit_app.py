@@ -56,7 +56,7 @@ st.error(f"系统风控：{risk_msg} (当前建议最高总仓位：{max_pos*100
 
 # 2. 多标的动态池管理 (3支持仓)
 st.subheader("📊 核心持仓动态监控")
-my_holdings = st.multiselect("当前持仓组合 (最多建议3支)", ["002400", "600986", "000001", "300059"], default=["002400"])
+my_holdings = st.multiselect("当前持仓组合 (最多建议3支)", ["600879", "600977",  "002400"], default=["002400"])
 
 cols = st.columns(len(my_holdings))
 for i, stock in enumerate(my_holdings):
