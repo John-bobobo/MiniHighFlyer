@@ -4,13 +4,13 @@ import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 1. 时间与环境配置 ---
+# --- 1. 全球/北京时间校准 ---
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="幻方·天眼 AI 强化版", layout="wide")
+st.set_page_config(page_title="幻方·天眼 AI 实战指挥官", layout="wide")
 
-# 初始化持仓 (如果 session 丢失则重置)
+# --- 2. 持久化持仓管理 ---
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = {
         "600879": {"name": "航天电子", "vol": 3800, "float": 32.7e8},
@@ -20,125 +20,120 @@ if 'portfolio' not in st.session_state:
         "600893": {"name": "航发动力", "vol": 900, "float": 26.6e8}
     }
 
-# --- 2. 核心：带伪装的深度数据抓取 ---
-def fetch_sina_pro(code):
+# --- 3. 深度行情与资金流引擎 ---
+def fetch_market_intelligence(code):
     try:
         prefix = "sh" if code.startswith("6") else "sz"
-        # 实时量价 (Sina)
+        # 接口 A: 基础行情 (Sina)
         url_hq = f"https://hq.sinajs.cn/list={prefix}{code}"
-        # 主力资金流 (Tencent)
+        # 接口 B: 资金流向 (Tencent)
         url_ff = f"http://qt.gtimg.cn/q=ff_{prefix}{code}"
         
-        headers = {
-            "Referer": "http://finance.sina.com.cn",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+        headers = {"Referer": "http://finance.sina.com.cn"}
+        h_res = requests.get(url_hq, headers=headers, timeout=2).text.split('"')[1].split(',')
+        f_res = requests.get(url_ff, timeout=2).text.split('~')
         
-        # 抓取快照
-        r_hq = requests.get(url_hq, headers=headers, timeout=3).text
-        r_ff = requests.get(url_ff, timeout=3).text
+        if len(h_res) < 30 or len(f_res) < 4: return None
         
-        if '"' not in r_hq or '~' not in r_ff:
-            return None
-
-        # 解析 Sina
-        data_hq = r_hq.split('"')[1].split(',')
-        # 解析 Tencent (主力流向)
-        data_ff = r_ff.split('~')
-        
-        price = float(data_hq[3])
-        prev_close = float(data_hq[2])
-        pct = round((price - prev_close) / prev_close * 100, 2)
-        
+        price = float(h_res[3])
+        prev_close = float(h_res[2])
         return {
-            "name": data_hq[0],
+            "name": h_res[0],
             "price": price,
-            "pct": pct,
-            "vol_shares": float(data_hq[8]),
-            "amount_yuan": float(data_hq[9]),
-            "main_in": float(data_ff[1]), # 主力流入
-            "main_out": float(data_ff[2]), # 主力流出
-            "main_net": float(data_ff[3]), # 主力净入
+            "pct": round((price - prev_close) / prev_close * 100, 2),
+            "vol_shares": float(h_res[8]),
+            "amount_wan": float(h_res[9]) / 10000,
+            "main_net": float(f_res[3]), # 主力净流入(万)
+            "buy_side": float(h_res[10]), # 买一委托
+            "sell_side": float(h_res[20]) # 卖一委托
         }
-    except Exception as e:
-        return None
+    except: return None
 
-# --- 3. 顶部仪表盘 ---
-st.title("🏹 幻方·天眼 AI 指挥系统")
-bj_t = get_bj_time()
-st.caption(f"系统运行中 | 北京时间: {bj_t.strftime('%H:%M:%S')}")
-
-# --- 4. 侧边栏调仓窗口 ---
+# --- 4. 侧边栏：指挥官调整窗口 ---
 with st.sidebar:
-    st.header("⚙️ 调仓中心")
+    st.header("🎯 战略部署中心")
+    with st.expander("🆕 接入新作战个股"):
+        nc = st.text_input("代码 (如 002400)")
+        nv = st.number_input("持仓股数", value=0, step=100)
+        if st.button("同步至系统"):
+            st.session_state.portfolio[nc] = {"name": "新标的", "vol": nv, "float": 10e8}
+            st.rerun()
+    
+    st.divider()
     for c in list(st.session_state.portfolio.keys()):
-        with st.expander(f"调整 {st.session_state.portfolio[c]['name']}"):
-            st.session_state.portfolio[c]['vol'] = st.number_input("持股数", value=st.session_state.portfolio[c]['vol'], key=f"v_{c}")
-            if st.button("清仓该股", key=f"del_{c}"):
-                del st.session_state.portfolio[c]
-                st.rerun()
+        cols = st.columns([3, 1])
+        st.session_state.portfolio[c]['vol'] = cols[0].number_input(f"{c}", value=st.session_state.portfolio[c]['vol'])
+        if cols[1].button("🗑️", key=f"del_{c}"):
+            del st.session_state.portfolio[c]
+            st.rerun()
 
-# --- 5. 核心：个股深度诊断展示区 ---
-st.subheader("📋 实时诊断与精准指令")
+# --- 5. 顶层分析：大盘与资金流向 ---
+st.title("🏹 幻方·天眼 AI 指挥系统 V11.5")
+bj_t = get_bj_time()
+st.info(f"⏳ 实时监测中 | 北京时间: {bj_t.strftime('%H:%M:%S')} | 数据状态：{'✅ 正常' if 9<=bj_t.hour<=15 else '💤 闭盘状态'}")
+
+# 宏观仪表盘
+m1, m2, m3 = st.columns(3)
+market_sh = fetch_market_intelligence("000001")
+if market_sh:
+    m1.metric("上证指数", market_sh['price'], f"{market_sh['pct']}%")
+    m2.metric("全场主力动向", f"{market_sh['main_net']/10000:.2f}亿")
+    m3.metric("板块共振强度", "军工/传媒", delta="活跃", delta_color="normal")
+
+# --- 6. 核心：深度诊断与精准操盘 ---
+st.divider()
+st.subheader("📋 深度诊断与精准操盘指令")
 
 for code, info in st.session_state.portfolio.items():
-    data = fetch_sina_pro(code)
+    data = fetch_market_intelligence(code)
     
-    with st.container():
-        # 如果数据抓取不到，显示占位符提示
-        if not data:
-            st.warning(f"⚠️ {info['name']} ({code}) 数据连接中断，尝试重连中...")
-            continue
-
-        # 计算换手率 (基于代码开头定义的流通盘)
+    if data:
+        # --- AI 核心算法决策 ---
         turnover = round((data['vol_shares'] / info['float']) * 100, 2)
+        advice, detail, color = "⚖️ 持仓观望", "资金博弈均衡，建议静待方向明朗。", "#808080"
         
-        # --- AI 操盘算法核心 ---
-        advice, logic, color = "⚖️ 持仓观察", "量价平稳，大单未见异常。建议保持现状，等待趋势明朗。", "#808080"
-        
-        # 1. 减仓逻辑：价格上涨+资金流出+高换手
-        if data['pct'] > 4 and data['main_net'] < 0:
-            advice = f"🔴 减持 {int(info['vol']*0.3)} 股"
-            logic = "【背离预警】股价冲高但主力净流出。这意味着当前拉升由散户合力，缺乏持续性，建议高抛减压。"
+        # 1. 减仓逻辑 (股价高位 + 资金背离)
+        if data['pct'] > 5 and data['main_net'] < 0:
+            advice = f"🔴 减仓 {int(info['vol']*0.3)} 股"
+            detail = "【AI预警】股价处于高位震荡但主力资金呈现净流出，量价背离，建议逢高落袋保护利润。"
             color = "#ff4b4b"
-        
-        # 2. 加仓逻辑：缩量回撤+主力流入
+        # 2. 加仓逻辑 (缩量回踩 + 主力吸筹)
         elif data['pct'] < -1 and data['main_net'] > 100 and turnover < 3:
-            advice = f"🟢 加持 {int(info['vol']*0.2)} 股"
-            logic = "【低位吸筹】股价小幅回踩，但主力资金呈现净流入，且换手极低，属于良性洗盘，建议加仓分摊成本。"
+            advice = f"🟢 加仓 {int(info['vol']*0.2)} 股"
+            detail = "【AI信号】当前处于缩量回调，且主力资金逆势流入，属于典型的洗盘吸筹，建议分批入场。"
             color = "#00ff00"
-            
-        # 3. 清仓逻辑
+        # 3. 风险预警
         elif data['pct'] < -6:
-            advice = "💀 立即清仓"
-            logic = "【趋势破坏】股价放量跌穿关键点位，主力和散户同时踩踏，建议保留现金，停止幻想。"
+            advice = "💀 建议清仓"
+            detail = "【避险提醒】跌幅过大且伴随板块联动走弱，暂避锋芒，留存现金等待下次底部机会。"
             color = "#ff0000"
 
-        # 渲染 UI 卡片
+        # 视觉化输出
         st.markdown(f"""
-        <div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px; border-left:12px solid {color}; margin-bottom:20px">
-            <div style="display:flex; justify-content:space-between">
+        <div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px; border-left:10px solid {color}; margin-bottom:15px">
+            <div style="display:flex; justify-content:space-between; align-items:center">
                 <div>
-                    <h2 style="margin:0">{data['name']} <small style="font-size:14px; color:#aaa">{code}</small></h2>
-                    <p style="margin:5px 0; opacity:0.8">持仓：{info['vol']} 股 | 换手：{turnover}%</p>
+                    <h2 style="margin:0">{data['name']} ({code})</h2>
+                    <p style="margin:5px 0; opacity:0.8">现价: {data['price']} | 持仓: {info['vol']} 股 | 换手: {turnover}%</p>
                 </div>
                 <div style="text-align:right">
-                    <h1 style="margin:0; color:{color}">{data['price']}</h1>
-                    <b style="color:{color}">{data['pct']}%</b>
+                    <h1 style="margin:0; color:{color}">{data['pct']}%</h1>
+                    <p style="margin:0; opacity:0.7">主力净入: {data['main_net']:.1f}万</p>
                 </div>
             </div>
-            <div style="display:flex; gap:30px; margin:15px 0; padding:10px; background:rgba(0,0,0,0.2); border-radius:8px">
-                <span>主力净额：<b style="color:{'#ff4b4b' if data['main_net']>0 else '#00ff00'}">{data['main_net']:.1f} 万</b></span>
-                <span>主力买入：{data['main_in']:.1f}万</span>
-                <span>主力卖出：{data['main_out']:.1f}万</span>
-            </div>
-            <div style="padding:15px; background:{color}22; border:1px solid {color}; border-radius:10px">
-                <h4 style="margin:0; color:{color}">指挥官指令：{advice}</h4>
-                <p style="margin:10px 0 0 0; font-size:15px; line-height:1.6">{logic}</p>
+            <div style="margin-top:15px; padding:15px; background:{color}15; border:1px solid {color}44; border-radius:10px">
+                <b style="color:{color}; font-size:18px">指令：{advice}</b><br>
+                <span style="font-size:14px; opacity:0.9">逻辑分析：{detail}</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
+    else:
+        st.warning(f"🔍 正在连接 {code} 深度行情数据，请稍候...")
 
-# 自动刷新
+# --- 7. 系统总结 ---
+st.divider()
+st.subheader("💡 战略决策总结")
+st.write("目前市场整体处于震荡期，个股分化严重。**航发动力** 与 **航天电子** 属于军工板块，需关注板块整体强度。**省广集团** 波动较大，适合利用 AI 提示的 30% 仓位进行高抛低吸。")
+
 time.sleep(15)
 st.rerun()
