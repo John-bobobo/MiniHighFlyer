@@ -1,92 +1,96 @@
 import streamlit as st
+import akshare as ak
 import pandas as pd
 import requests
 import time
 from datetime import datetime, timedelta, timezone
 
-# --- 配置区 ---
-SC_KEY = "你的Server酱SendKey" 
-
-st.set_page_config(page_title="幻方级风控终端", layout="wide")
+st.set_page_config(page_title="幻方智能指挥部V5.0", layout="wide")
 
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# --- 🚀 极速行情解码器 (带环境因子) ---
-def get_stock_rich_logic(code):
+# --- 1. 核心数据引擎：获取资金流向与基本面 ---
+@st.cache_data(ttl=30)
+def fetch_rich_data():
     try:
-        prefix = "sh" if code.startswith("6") else "sz"
-        url = f"http://qt.gtimg.cn/q={prefix}{code}" # 换成全量接口获取换手
-        r = requests.get(url, timeout=3)
-        data = r.text.split('~')
-        # data[3]:价格, data[32]:涨跌幅, data[38]:换手率, data[37]:成交额
-        return {
-            "name": data[1],
-            "price": float(data[3]),
-            "pct": float(data[32]),
-            "turnover": float(data[38]) if data[38] else 0,
-            "amount": float(data[37]) if data[37] else 0
-        }
-    except: return None
+        # 获取实时行情全表，包含资金流、换手、市盈率等
+        df = ak.stock_zh_a_spot_em()
+        return df
+    except:
+        return None
 
-# 获取大盘（上证）作为风控基准
-def get_market_risk():
-    res = get_stock_rich_logic("000001") # 上证指数
-    if res and res['pct'] < -1.5:
-        return True # 市场系统性风险触发
-    return False
+# --- 2. 智能寻找板块龙头 ---
+def find_market_leader(df_all):
+    try:
+        # 简单逻辑：取当前全市场涨幅前 3 且成交额大于 10 亿的票作为“市场风向标”
+        hot_stocks = df_all[df_all['成交额'] > 1000000000].sort_values('涨跌幅', ascending=False).head(3)
+        return hot_stocks
+    except:
+        return None
+
+# --- 3. 选股雷达：自动扫描潜力股 ---
+def stock_scanner(df_all):
+    # 筛选条件：1. 涨幅在 3%-7% 之间（非涨停封死）2. 换手率 > 5% 3. 主力净流入为正
+    potential = df_all[
+        (df_all['涨跌幅'] > 3) & 
+        (df_all['涨跌幅'] < 9) & 
+        (df_all['换手率'] > 5) & 
+        (df_all['主力净流入'] > 0)
+    ].sort_values('主力净流入', ascending=False).head(5)
+    return potential
 
 # --- UI 渲染 ---
-st.title("🛡️ 幻方 V4.6 | 深度风控版")
+st.title("🛡️ 幻方智能指挥部 V5.0")
 bj_now = get_bj_time()
-st.write(f"🕒 北京时间: {bj_now.strftime('%H:%M:%S')}")
+st.sidebar.info(f"🕒 实时监测中: {bj_now.strftime('%H:%M:%S')}")
 
-# 大盘预警
-market_crash = get_market_risk()
-if market_crash:
-    st.error("🚨 警告：大盘整体跌幅超 1.5%，系统已封锁所有加仓建议，进入避险模式！")
+df_all = fetch_rich_data()
 
-# 侧边栏设置
-my_stocks = st.sidebar.text_input("持仓 (逗号分隔)", value="002400,600986")
-lead_code = st.sidebar.text_input("参考龙头", value="600986")
-stock_list = [s.strip() for s in my_stocks.split(",")]
+if df_all is not None:
+    # --- 第一部分：市场风向标 (自动寻找龙头) ---
+    leaders = find_market_leader(df_all)
+    st.subheader("🔥 当前市场领涨锚点 (系统自动识别)")
+    l_cols = st.columns(3)
+    for idx, (i, r) in enumerate(leaders.iterrows()):
+        l_cols[idx].metric(f"标杆: {r['名称']}", f"{r['最新价']}", f"{r['涨跌幅']}%")
 
-leader_data = get_stock_rich_logic(lead_code)
+    # --- 第二部分：持仓深度诊断 ---
+    st.divider()
+    my_stocks_input = st.sidebar.text_input("输入持仓代码", value="002400,600986,000001")
+    my_list = [s.strip() for s in my_stocks_input.split(",")]
+    
+    st.subheader("📊 深度持仓诊断")
+    for code in my_list:
+        try:
+            row = df_all[df_all['代码'] == code].iloc[0]
+            # 综合评分逻辑 (简单演示)
+            flow = row['主力净流入'] / 10000 # 万
+            
+            # 决策逻辑
+            action, color = "💎 正常持仓", "#FFFFFF"
+            if row['涨跌幅'] > 5 and flow < 0: action, color = "⚠️ 缩量诱高：建议减仓", "#ff4b4b"
+            elif row['涨跌幅'] < -3 and flow > 1000: action, color = "🟢 底部吸筹：建议补仓", "#00ff00"
+            elif row['涨跌幅'] > 9.5: action, color = "🔥 强势封板：持股待涨", "#ff0000"
+            
+            with st.expander(f"🔍 {row['名称']} ({code}) - 当前建议：{action}", expanded=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("最新价", row['最新价'], f"{row['涨跌幅']}%")
+                c2.metric("主力净流入", f"{flow:.1f}万")
+                c3.metric("换手率", f"{row['换手率']}%")
+                c4.metric("市盈率(动态)", f"{row['动态市盈率']:.1f}")
+                st.progress(min(max(row['涨跌幅']+10, 0)/20, 1.0), text="多空博弈能量")
+        except:
+            st.error(f"代码 {code} 数据解析异常")
 
-if leader_data:
-    cols = st.columns(len(stock_list))
-    for i, code in enumerate(stock_list):
-        with cols[i]:
-            res = get_stock_rich_logic(code)
-            if res:
-                gap = res['pct'] - leader_data['pct']
-                
-                # --- 核心深度决策算法 ---
-                status, color = "⚖️ 持仓观望", "#808080"
-                
-                # 情况 A：放量大跌 -> 必须清仓 (不管龙头)
-                if res['pct'] < -5 and res['turnover'] > 10:
-                    status, color = "💀 异常放量：立即清仓", "#8b0000"
-                # 情况 B：系统性风险 -> 禁止买入
-                elif market_crash and res['pct'] < 0:
-                    status, color = "🛡️ 覆巢无完卵：严禁加仓", "#ffaa00"
-                # 情况 C：缩量回踩且龙头强势 -> 补涨逻辑
-                elif gap < -4 and res['turnover'] < 5 and not market_crash:
-                    status, color = "💎 缩量回踩：建议补仓", "#00ff00"
-                # 情况 D：高位换手过热 -> 止盈逻辑
-                elif res['pct'] > 5 and res['turnover'] > 15:
-                    status, color = "🔥 换手过热：分批获利", "#ff4b4b"
+    # --- 第三部分：大数据选股雷达 ---
+    st.divider()
+    st.subheader("📡 大数据主力异动雷达 (此时此刻该看谁？)")
+    potentials = stock_scanner(df_all)
+    st.table(potentials[['代码', '名称', '最新价', '涨跌幅', '换手率', '主力净流入']])
 
-                st.markdown(f"""
-                <div style="background-color:rgba(255,255,255,0.05); padding:15px; border-radius:15px; border-left:10px solid {color}">
-                    <h3 style="margin:0">{res['name']} ({code})</h3>
-                    <h1 style="color:{color}; margin:5px 0">{res['price']} <small>({res['pct']}%)</small></h1>
-                    <p style="font-size:14px">换手: {res['turnover']}% | 龙头偏差: {gap:.2f}%</p>
-                    <div style="background:{color}; color:white; padding:5px; border-radius:5px; text-align:center; font-weight:bold">
-                        {status}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+else:
+    st.error("数据引擎连接中，请稍后...")
 
 # 自动刷新
 time.sleep(30)
