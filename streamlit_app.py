@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 3.1 | 次日实时执行+风险报警", layout="wide")
+st.set_page_config(page_title="尾盘博弈 3.2 | 次日实时执行+风险报警", layout="wide")
 
 # ======================
 # Session初始化
@@ -95,6 +95,7 @@ def next_day_instruction(stock):
     if not stock:
         return "今日尾盘结构不健康，建议空仓"
 
+    shares = int(50000 / stock['price'] / 100)*100
     instructions = f"""
     ### 次日操作指引
     - **竞价阶段 (9:15-9:25)**
@@ -111,9 +112,9 @@ def next_day_instruction(stock):
     - **止损**
         - 跌破买入价 -3% → 无条件止损
     - **仓位建议**
-        - 50,000元模拟：{int(50000/stock['price']/100)*100}股
+        - 50,000元模拟：{shares}股
         - 买入参考价：¥{stock['price']}
-        - 预计占用资金：¥{int(50000/stock['price']/100)*100*stock['price']:.2f}
+        - 预计占用资金：¥{shares*stock['price']:.2f}
     """
     return instructions
 
@@ -150,11 +151,13 @@ def real_time_monitor(stock):
 # UI
 # ======================
 t = get_bj_time()
-st.title("🏹 尾盘博弈 3.1 | 次日动态执行系统+风险报警")
+st.title("🏹 尾盘博弈 3.2 | 次日动态执行系统+风险报警")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
-# 14:40-14:55 尾盘扫描锁定决策
-if t.hour==14 and 40<=t.minute<=55 and not st.session_state.final_decision:
+# ======================
+# 尾盘扫描锁定决策 (14:40-14:55 或页面打开后立即扫描保证显示)
+# ======================
+if (t.hour==14 and 40<=t.minute<=55) or (st.session_state.final_decision is None):
     result = scan_market(top_n=2)
     st.session_state.final_decision = result
     st.session_state.decision_time = t.strftime('%Y-%m-%d %H:%M:%S')
@@ -164,24 +167,25 @@ decision = st.session_state.final_decision
 # ======================
 # 展示选股和操作指引
 # ======================
-if decision:
-    if len(decision)==0:
-        st.error("❌ 今日尾盘结构不健康 —— 建议空仓")
-    else:
-        st.success("🎯 尾盘结构最健康标的 Top2")
-        for idx, stock in enumerate(decision):
-            st.markdown(f"### {idx+1}. {stock['name']} ({stock['code']})")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("尾盘收盘价", f"¥{stock['price']}")
-                st.metric("尾盘涨幅", f"{stock['pct']}%")
-            with col2:
-                shares = int(50000 / stock['price'] / 100)*100
-                st.metric("建议仓位", f"{shares} 股")
-                st.metric("预计资金", f"¥{shares*stock['price']:.2f}")
-            st.markdown(next_day_instruction(stock), unsafe_allow_html=True)
+if decision is None:
+    st.info("⌛ 尾盘扫描等待中或尚未完成，请耐心等待...")
+elif len(decision)==0:
+    st.error("❌ 今日尾盘结构不健康 —— 建议空仓")
+else:
+    st.success("🎯 尾盘结构最健康标的 Top2")
+    for idx, stock in enumerate(decision):
+        st.markdown(f"### {idx+1}. {stock['name']} ({stock['code']})")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("尾盘收盘价", f"¥{stock['price']}")
+            st.metric("尾盘涨幅", f"{stock['pct']}%")
+        with col2:
+            shares = int(50000 / stock['price'] / 100)*100
+            st.metric("建议仓位", f"{shares} 股")
+            st.metric("预计资金", f"¥{shares*stock['price']:.2f}")
+        st.markdown(next_day_instruction(stock), unsafe_allow_html=True)
 
-    st.caption(f"🔒 尾盘决策锁定时间：{st.session_state.decision_time}")
+st.caption(f"🔒 尾盘决策锁定时间：{st.session_state.decision_time}")
 
 # ======================
 # 9:15-9:25 竞价实时监控 + 风险报警
@@ -201,7 +205,7 @@ if decision and t.hour==9 and 15<=t.minute<=25:
 # ======================
 # 自动刷新
 # ======================
-if 9 <= t.hour <= 15:
+if 9 <= t.hour <= 15 or (14<=t.hour<=15):
     time.sleep(20)
     st.rerun()
 
