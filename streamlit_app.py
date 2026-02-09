@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 4.3 | 稳定增强版+连板概率", layout="wide")
+st.set_page_config(page_title="尾盘博弈 4.4 | 主升浪捕捉版", layout="wide")
 
 # ======================
 # Session初始化
@@ -33,19 +33,18 @@ def get_index_pct():
         return 0.0
 
 # ======================
-# 尾盘扫描函数（4.3 稳定增强 + 连板概率）
+# 尾盘扫描函数（4.4 主升浪优先）
 # ======================
 def scan_market(top_n=2):
-    index_pct = get_index_pct()
     try:
         url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=150&sort=changepercent&asc=0&node=hs_a"
         headers = {"Referer": "http://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=3).json()
     except:
-        res = []
+        return []
 
     candidates = []
-    fallback_pool = []
+    secondary_candidates = []
 
     for s in res:
         try:
@@ -57,50 +56,64 @@ def scan_market(top_n=2):
             amount = float(s['amount']) / 1e8
             price = float(s['trade'])
             high = float(s['high'])
-            turnover = float(s.get('turnoverratio',0))
-            consecutive_limit = int(s.get('consecutive_limit',0)) if 'consecutive_limit' in s else 0  # 连板信息
+            turnover = float(s.get('turnoverratio', 0))
 
-            # --- 主结构条件（放宽版） ---
-            if (2 <= pct <= 9.5) and amount > 2 and (price/high >= 0.98) and (5 <= turnover <= 30):
-                # 连板概率加权
-                limit_prob = 0.05 + 0.1 * consecutive_limit
-                score = pct*0.5 + amount*0.3 + turnover*0.2 + (price/high)*5 + limit_prob*10
+            code_pre = "sh" if code.startswith("6") else "sz"
+
+            # 获取尾盘5分钟K线数据判断主升浪
+            try:
+                m5_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code_pre}{code}&scale=5&datalen=6"
+                m5_data = requests.get(m5_url, timeout=2).json()
+                if len(m5_data) >= 2:
+                    last_swing = (float(m5_data[-1]['close']) - float(m5_data[-2]['close'])) / float(m5_data[-2]['close'])
+                else:
+                    last_swing = 0
+            except:
+                last_swing = 0
+
+            # 是否尾盘主升浪（未涨停）
+            if price < high*0.998 and last_swing > 0.005 and pct < 9.5:
+                score = pct*0.4 + amount*0.3 + turnover*0.3
                 candidates.append({
-                    "code": code,
-                    "name": s['name'],
-                    "price": price,
-                    "pct": pct,
-                    "amount": amount,
-                    "turnover": turnover,
-                    "score": score,
-                    "limit_prob": limit_prob
+                    "code": code, "name": s['name'], "price": price,
+                    "pct": pct, "amount": amount, "turnover": turnover,
+                    "score": score, "type":"启动股"
                 })
-
-            # --- 兜底池（保证必出股） ---
-            if pct > 1 and amount > 1.5:
-                fallback_pool.append({
-                    "code": code,
-                    "name": s['name'],
-                    "price": price,
-                    "pct": pct,
-                    "amount": amount,
-                    "turnover": turnover
+            # 首板涨停次选
+            elif pct >= 9.5:
+                # 连板概率简单加权
+                prob = 0.5 + min(turnover/50,0.5)
+                score = pct*0.3 + amount*0.3 + turnover*0.2 + prob*0.2
+                secondary_candidates.append({
+                    "code": code, "name": s['name'], "price": price,
+                    "pct": pct, "amount": amount, "turnover": turnover,
+                    "score": score, "type":"首板涨停"
                 })
-
         except:
             continue
 
-    # 调试信息
-    # print(f"[DEBUG] 主候选股: {len(candidates)}, 兜底池: {len(fallback_pool)}, 大盘涨幅: {index_pct}")
-
+    # 优先返回未涨停启动股
     if candidates:
         candidates.sort(key=lambda x: x['score'], reverse=True)
         return candidates[:top_n]
-    elif fallback_pool:
-        fallback_pool.sort(key=lambda x: (x['pct'], x['amount']), reverse=True)
-        return fallback_pool[:1]
-    else:
-        return []
+
+    # 次选首板涨停
+    if secondary_candidates:
+        secondary_candidates.sort(key=lambda x: x['score'], reverse=True)
+        return secondary_candidates[:1]
+
+    # 兜底池：尾盘涨幅+成交额最高
+    fallback_pool = [s for s in res if float(s['changepercent'])>1 and float(s['amount'])/1e8>1]
+    if fallback_pool:
+        fallback_pool.sort(key=lambda x: (float(x['changepercent']), float(x['amount'])/1e8), reverse=True)
+        s = fallback_pool[0]
+        return [{
+            "code": s['code'], "name": s['name'], "price": float(s['trade']),
+            "pct": float(s['changepercent']), "amount": float(s['amount'])/1e8,
+            "turnover": float(s.get('turnoverratio',0)), "score":0, "type":"兜底股"
+        }]
+
+    return []
 
 # ======================
 # 次日操作指引
@@ -108,55 +121,48 @@ def scan_market(top_n=2):
 def next_day_instruction(stock):
     shares = int(50000 / stock['price'] / 100) * 100
     instructions = f"""
-### 次日操作指引
-- **竞价阶段 (9:15-9:25)**
-    - 高开 0~3% → 持仓
-    - 高开 >5% → 9:35减半
-    - 低开 -2% → 反抽卖出
-    - 低开 < -3% → 竞价直接空仓
-
-- **9:30-9:40**
-    - 快速封板 → 不动
-    - 未封板但盈利 → 分批止盈
-    - 未脱离成本 → 全部卖出
-
-- **止损**
-    - 跌破买入价 -3% → 无条件止损
-
-- **仓位参考**
-    - 建议买入股数：{shares} 股
-    - 买入参考价：¥{stock['price']}
-    - 预计占用资金：¥{shares * stock['price']:.2f}
-"""
+    ### 次日操作指引
+    - **竞价阶段 (9:15-9:25)**
+        - 高开 0~3% → 持仓
+        - 高开 >5% → 9:35减半
+        - 低开 -2% → 反抽卖出
+        - 低开 < -3% → 竞价直接空仓
+    - **早盘 (9:30-9:40)**
+        - 快速封板 → 不动
+        - 未封板但盈利 → 分批止盈
+        - 未脱离成本 → 全部卖出
+    - **止损**
+        - 跌破买入价 -3% → 无条件止损
+    - **仓位参考**
+        - 建议买入股数：{shares} 股
+        - 买入参考价：¥{stock['price']}
+        - 预计占用资金：¥{shares*stock['price']:.2f}
+    - **股类型**：{stock.get('type','未知')}
+    """
     return instructions
 
 # ======================
 # UI
 # ======================
 t = get_bj_time()
-st.title("🏹 尾盘博弈 4.3 | 稳定增强执行系统 + 连板概率")
+st.title("🏹 尾盘博弈 4.4 | 主升浪捕捉系统")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
-# ======================
-# 尾盘扫描逻辑 (保证 14:40 一定出股)
-# ======================
-if (t.hour == 14 and 40 <= t.minute <= 55) or (st.session_state.final_decision is None):
+# 尾盘扫描逻辑
+if (t.hour==14 and 40<=t.minute<=55) or (st.session_state.final_decision is None):
     result = scan_market(top_n=2)
     st.session_state.final_decision = result
     st.session_state.decision_time = t.strftime('%Y-%m-%d %H:%M:%S')
 
 decision = st.session_state.final_decision
-index_pct = get_index_pct()
 
-# ======================
 # 展示结果
-# ======================
 if decision is None:
     st.info("⌛ 等待尾盘扫描...")
 elif len(decision) == 0:
-    st.error(f"❌ 尾盘结构不够健康 —— 今日建议空仓 | 大盘涨幅: {index_pct}%")
+    st.error("❌ 今日尾盘结构偏弱 —— 建议空仓")
 else:
-    st.success("🎯 尾盘结构优选标的")
+    st.success("🎯 尾盘主升浪标的优选")
     for idx, stock in enumerate(decision):
         st.markdown(f"### {idx+1}. {stock['name']} ({stock['code']})")
         col1, col2 = st.columns(2)
@@ -167,22 +173,17 @@ else:
             shares = int(50000 / stock['price'] / 100) * 100
             st.metric("建议仓位", f"{shares} 股")
             st.metric("预计资金", f"¥{shares * stock['price']:.2f}")
-
         st.markdown(next_day_instruction(stock), unsafe_allow_html=True)
 
 st.caption(f"🔒 决策锁定时间：{st.session_state.decision_time}")
 
-# ======================
 # 自动刷新
-# ======================
-if 9 <= t.hour <= 15:
+if 9 <= t.hour <= 15 or (14<=t.hour<=15):
     time.sleep(20)
     st.rerun()
 
-# ======================
 # 回测记录
-# ======================
-if decision and t.hour > 15:
+if decision and t.hour>15:
     today = t.strftime('%Y-%m-%d')
     for stock in decision:
         st.session_state.daily_log.loc[len(st.session_state.daily_log)] = [
