@@ -3,6 +3,7 @@ import requests
 import time
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 # ======================
 # 时间函数
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 4.6 | 主升浪优选版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 5.0 | 主线板块龙头版", layout="wide")
 
 # ======================
 # Session初始化
@@ -21,36 +22,55 @@ if "decision_time" not in st.session_state:
     st.session_state.decision_time = ""
 if "daily_log" not in st.session_state:
     st.session_state.daily_log = pd.DataFrame(columns=["date","stock","decision","result"])
-if "real_time_status" not in st.session_state:
-    st.session_state.real_time_status = {}
 
 # ======================
-# 获取指数涨跌幅
+# 获取市场数据
 # ======================
-def get_index_pct():
+def get_market_data():
     try:
-        sh = requests.get("http://qt.gtimg.cn/q=s_sh000001", timeout=2).text.split('~')
-        return float(sh[3])
-    except:
-        return 0.0
-
-# ======================
-# 尾盘扫描函数 (4.6 主升浪优选版)
-# ======================
-def scan_market(top_n=2):
-
-    index_pct = get_index_pct()
-    try:
-        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=150&sort=changepercent&asc=0&node=hs_a"
+        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=200&sort=changepercent&asc=0&node=hs_a"
         headers = {"Referer": "http://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=3).json()
+        return requests.get(url, headers=headers, timeout=3).json()
     except:
         return []
 
-    candidates = []
-    fallback_pool = []
+# ======================
+# 获取个股板块（概念）
+# ======================
+def get_stock_concept(code):
+    try:
+        url = f"http://vip.stock.finance.sina.com.cn/corp/go.php/vCI_StockStructure/stockid/{code}.phtml"
+        res = requests.get(url, timeout=2).text
+        # 简化处理（实际接口复杂，这里做基础概念归类）
+        if "新能源" in res:
+            return "新能源"
+        if "人工智能" in res:
+            return "人工智能"
+        if "半导体" in res:
+            return "半导体"
+        return "其他"
+    except:
+        return "其他"
 
-    for s in res:
+# ======================
+# 主升浪 5.0 板块优选扫描
+# ======================
+def scan_market(top_n=2):
+
+    data = get_market_data()
+    if not data:
+        return []
+
+    sector_stats = defaultdict(lambda: {
+        "stocks": [],
+        "total_pct": 0,
+        "count": 0,
+        "strong_count": 0,
+        "total_amount": 0
+    })
+
+    # ---------- 统计板块强度 ----------
+    for s in data:
         try:
             code = s['code']
             if not (code.startswith('60') or code.startswith('00')):
@@ -58,29 +78,83 @@ def scan_market(top_n=2):
 
             pct = float(s['changepercent'])
             amount = float(s['amount']) / 1e8
-            price = float(s['trade'])
-            high = float(s['high'])
             turnover = float(s.get('turnoverratio', 0))
 
-            # ---------- 尾盘动能 ----------
-            tail_up = 0
-            try:
-                code_pre = "sh" if code.startswith("6") else "sz"
-                m5_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code_pre}{code}&scale=5&datalen=6"
-                m5 = requests.get(m5_url, timeout=2).json()
-                if len(m5) >= 2:
-                    tail_up = (float(m5[-1]['close']) - float(m5[-2]['close'])) / float(m5[-2]['close'])
-            except:
-                tail_up = 0
+            concept = get_stock_concept(code)
 
-            # ---------- 主升浪优先筛选 ----------
-            if 3 <= pct <= 7:   # 今日涨幅 3~7%
-                score = (
-                    0.2*pct + 
-                    0.4*amount + 
-                    0.3*tail_up*100 +  # 转成百分比
-                    0.1*turnover
+            sector_stats[concept]["stocks"].append(s)
+            sector_stats[concept]["total_pct"] += pct
+            sector_stats[concept]["count"] += 1
+            sector_stats[concept]["total_amount"] += amount
+            if pct > 3:
+                sector_stats[concept]["strong_count"] += 1
+
+        except:
+            continue
+
+    # ---------- 计算板块评分 ----------
+    sector_scores = []
+
+    for sector, stats in sector_stats.items():
+        if stats["count"] == 0:
+            continue
+
+        avg_pct = stats["total_pct"] / stats["count"]
+
+        score = (
+            0.4 * avg_pct +
+            0.4 * stats["strong_count"] +
+            0.2 * stats["total_amount"]
+        )
+
+        sector_scores.append((sector, score))
+
+    if not sector_scores:
+        return []
+
+    sector_scores.sort(key=lambda x: x[1], reverse=True)
+    strongest_sectors = [s[0] for s in sector_scores[:2]]
+
+    # ---------- 板块内选股 ----------
+    candidates = []
+
+    for sector in strongest_sectors:
+        for s in sector_stats[sector]["stocks"]:
+            try:
+                code = s['code']
+                pct = float(s['changepercent'])
+                amount = float(s['amount']) / 1e8
+                price = float(s['trade'])
+                turnover = float(s.get('turnoverratio', 0))
+
+                if not (3 <= pct <= 8):
+                    continue
+                if amount < 2:
+                    continue
+                if not (8 <= turnover <= 30):
+                    continue
+
+                # 尾盘动能
+                tail_up = 0
+                try:
+                    code_pre = "sh" if code.startswith("6") else "sz"
+                    m5_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code_pre}{code}&scale=5&datalen=6"
+                    m5 = requests.get(m5_url, timeout=2).json()
+                    if len(m5) >= 2:
+                        tail_up = (float(m5[-1]['close']) - float(m5[-2]['close'])) / float(m5[-2]['close'])
+                except:
+                    tail_up = 0
+
+                if tail_up <= 0:
+                    continue
+
+                stock_score = (
+                    0.4 * dict(sector_scores)[sector] +
+                    0.2 * pct +
+                    0.2 * amount +
+                    0.2 * tail_up * 100
                 )
+
                 candidates.append({
                     "code": code,
                     "name": s['name'],
@@ -88,73 +162,26 @@ def scan_market(top_n=2):
                     "pct": pct,
                     "amount": amount,
                     "turnover": turnover,
-                    "tail_up": tail_up,
-                    "score": score
+                    "sector": sector,
+                    "score": stock_score
                 })
 
-            # ---------- 兜底池 ----------
-            if pct > 1 and amount > 1.5:
-                fallback_pool.append({
-                    "code": code,
-                    "name": s['name'],
-                    "price": price,
-                    "pct": pct,
-                    "amount": amount,
-                    "turnover": turnover,
-                    "tail_up": tail_up
-                })
+            except:
+                continue
 
-        except:
-            continue
+    if not candidates:
+        return []
 
-    # 优先选择主升浪候选
-    if candidates:
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        return candidates[:top_n]
-
-    # 兜底逻辑
-    if fallback_pool:
-        fallback_pool.sort(key=lambda x: (x['tail_up'], x['pct'], x['amount']), reverse=True)
-        return fallback_pool[:1]
-
-    return []
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    return candidates[:top_n]
 
 # ======================
-# 次日操作指引
-# ======================
-def next_day_instruction(stock):
-    shares = int(50000 / stock['price'] / 100) * 100
-    instructions = f"""
-    ### 次日操作指引
-    - **竞价阶段**
-        - 高开 0~3% → 持仓
-        - 高开 >5% → 9:35减半
-        - 低开 -2% → 反抽卖出
-        - 低开 < -3% → 竞价直接空仓
-
-    - **9:30-9:40**
-        - 快速封板 → 不动
-        - 未封板但盈利 → 分批止盈
-        - 未脱离成本 → 全部卖出
-
-    - **止损**
-        - 跌破买入价 -3% → 无条件止损
-
-    - **仓位参考**
-        - 建议买入股数：{shares} 股
-        - 买入参考价：¥{stock['price']}
-        - 预计占用资金：¥{shares * stock['price']:.2f}
-    """
-    return instructions
-
-# ======================
-# UI显示
+# UI
 # ======================
 t = get_bj_time()
-st.title("🏹 尾盘博弈 4.6 | 主升浪优选版")
+st.title("🔥 尾盘博弈 5.0 | 主线板块龙头版")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
-# ---------- 尾盘扫描锁定 ----------
 if (t.hour == 14 and 40 <= t.minute <= 55) or (st.session_state.final_decision is None):
     result = scan_market(top_n=2)
     st.session_state.final_decision = result
@@ -162,45 +189,28 @@ if (t.hour == 14 and 40 <= t.minute <= 55) or (st.session_state.final_decision i
 
 decision = st.session_state.final_decision
 
-# ---------- 展示选股与操作指引 ----------
 if decision is None:
     st.info("⌛ 等待尾盘扫描...")
 elif len(decision) == 0:
-    st.error("❌ 今日未发现合适主升浪标的 —— 建议空仓")
+    st.error("❌ 今日主线不明确 —— 建议空仓")
 else:
-    st.success("🎯 尾盘主升浪优选标的")
+    st.success("🎯 主线板块龙头候选")
     for idx, stock in enumerate(decision):
+        shares = int(50000 / stock['price'] / 100) * 100
+
         st.markdown(f"### {idx+1}. {stock['name']} ({stock['code']})")
+        st.markdown(f"**所属主线板块：{stock['sector']}**")
+
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("尾盘收盘价", f"¥{stock['price']}")
-            st.metric("尾盘涨幅", f"{stock['pct']}%")
+            st.metric("尾盘价格", f"¥{stock['price']}")
+            st.metric("涨幅", f"{stock['pct']}%")
         with col2:
-            shares = int(50000 / stock['price'] / 100) * 100
             st.metric("建议仓位", f"{shares} 股")
             st.metric("预计资金", f"¥{shares * stock['price']:.2f}")
-        st.markdown(next_day_instruction(stock), unsafe_allow_html=True)
 
 st.caption(f"🔒 决策锁定时间：{st.session_state.decision_time}")
 
-# ======================
-# 自动刷新
-# ======================
 if 9 <= t.hour <= 15:
     time.sleep(20)
     st.rerun()
-
-# ======================
-# 回测日志
-# ======================
-if decision and t.hour > 15:
-    today = t.strftime('%Y-%m-%d')
-    for stock in decision:
-        st.session_state.daily_log.loc[len(st.session_state.daily_log)] = [
-            today,
-            stock['code'],
-            "买入",
-            "-"
-        ]
-    st.markdown("### 📊 今日回测日志")
-    st.dataframe(st.session_state.daily_log)
