@@ -11,7 +11,7 @@ from collections import defaultdict
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 简易版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 可视化增强版", layout="wide")
 
 # ======================
 # Session初始化
@@ -23,6 +23,7 @@ for key, default in {
     "decision_locked": False,
     "morning_locked": False,
     "decision_time": "",
+    "sector_strength": {},
     "flow_history": defaultdict(list)
 }.items():
     if key not in st.session_state:
@@ -66,6 +67,8 @@ def get_stock_concept(code):
 def scan_market():
     data = get_market_data()
     if not data: return
+    sector_stats = defaultdict(lambda: {"pct_sum":0,"amount_sum":0,"count":0})
+
     for s in data:
         try:
             code = s['code']
@@ -77,7 +80,7 @@ def scan_market():
             concept = get_stock_concept(code)
 
             # 资金流
-            st.session_state.flow_history[code].append(amount)
+            st.session_state.flow_history[s['name']].append(amount)
 
             # 简单评分
             score = 0.5*pct + 0.3*amount + 0.2*(1 if pct>5 else 0)
@@ -94,8 +97,19 @@ def scan_market():
                         "best_score": score, "price": price,
                         "pct": pct, "amount": amount
                     })
+
+            # 板块统计
+            sector_stats[concept]["pct_sum"] += pct
+            sector_stats[concept]["amount_sum"] += amount
+            sector_stats[concept]["count"] += 1
         except:
             continue
+
+    # 板块强度
+    st.session_state.sector_strength = {}
+    for sec,val in sector_stats.items():
+        if val["count"]>0:
+            st.session_state.sector_strength[sec] = (val["pct_sum"]*0.6 + val["amount_sum"]*0.4)/val["count"]
 
 # ======================
 # 获取Top股票
@@ -117,7 +131,7 @@ def calc_shares(stock, total_funds=TOTAL_FUNDS):
 # 主逻辑
 # ======================
 t = get_bj_time()
-st.title("🔥 尾盘博弈 简易版")
+st.title("🔥 尾盘博弈 可视化增强版")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
 before_1430 = (t.hour<14) or (t.hour==14 and t.minute<30)
@@ -136,28 +150,37 @@ if after_1430 and not st.session_state.decision_locked:
     st.session_state.decision_locked = True
 
 # ======================
-# 显示上午虚拟推荐
+# 布局
 # ======================
-if st.session_state.morning_decision:
-    st.info("🕚 上午虚拟推荐（观察用）")
-    for m in st.session_state.morning_decision:
-        st.write(f"{m['name']} | 板块: {m['sector']} | 当前分数: {round(m['best_score'],2)}")
+left_col, right_col = st.columns([1,2])
 
-# ======================
-# 显示最终尾盘推荐
-# ======================
-if st.session_state.final_decision:
-    st.success("🎯 14:30 尾盘锁定推荐")
-    for f in st.session_state.final_decision:
+# 左侧：板块趋势
+with left_col:
+    st.subheader("📊 板块轮动强度")
+    if st.session_state.sector_strength:
+        df_sector = pd.DataFrame([
+            {"板块":sec,"强度":round(val,2)} 
+            for sec,val in st.session_state.sector_strength.items()
+        ])
+        df_sector = df_sector.sort_values("强度",ascending=False)
+        st.bar_chart(df_sector.set_index("板块"))
+
+# 右侧：尾盘Top股票
+with right_col:
+    st.subheader(f"🎯 尾盘Top {TOP_N}组合")
+    top_stocks = st.session_state.final_decision or []
+    for f in top_stocks:
         shares = calc_shares(f)
-        st.write(f"股票: {f['name']} | 板块: {f['sector']} | 尾盘价: ¥{f['price']} | 建议仓位: {shares} 股")
+        pct_color = "🟢" if f['pct']>5 else ("🟡" if f['pct']>2 else "🔴")
+        st.markdown(f"**{pct_color} {f['name']}** | 板块: {f['sector']} | 尾盘价: ¥{f['price']} | 建议仓位: {shares} 股 | 涨幅: {f['pct']}%")
 
-    # 资金流折线
-    st.subheader("📈 尾盘资金流入趋势")
-    flow_df = pd.DataFrame()
-    for stock in st.session_state.final_decision:
-        flows = st.session_state.flow_history[stock['name']][-FLOW_HISTORY_LEN:]
-        flow_df[stock['name']] = flows
+# 底部：资金流折线
+st.subheader("📈 尾盘资金流入趋势")
+flow_df = pd.DataFrame()
+for stock in st.session_state.final_decision:
+    flows = st.session_state.flow_history[stock['name']][-FLOW_HISTORY_LEN:]
+    flow_df[stock['name']] = flows
+if not flow_df.empty:
     st.line_chart(flow_df)
 
 # 自动刷新
