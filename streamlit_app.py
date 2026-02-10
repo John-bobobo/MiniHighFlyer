@@ -33,9 +33,9 @@ for key, default in {
 # ======================
 # 参数设置
 # ======================
-TOTAL_FUNDS = 50000  # 总资金
-TOP_N = 5            # 尾盘组合选Top5股
-FLOW_HISTORY_LEN = 15 # 资金流向折线长度
+TOTAL_FUNDS = 50000        # 总资金
+TOP_N = 5                  # 尾盘组合选Top5股
+FLOW_HISTORY_LEN = 15      # 资金流折线长度
 
 # ======================
 # 获取市场数据
@@ -49,7 +49,7 @@ def get_market_data():
         return []
 
 # ======================
-# 获取概念
+# 获取概念板块
 # ======================
 def get_stock_concept(code):
     try:
@@ -63,7 +63,7 @@ def get_stock_concept(code):
         return "其他"
 
 # ======================
-# 扫描市场
+# 扫描市场（更新候选池 & 板块强度 & 资金流）
 # ======================
 def scan_market():
     data = get_market_data()
@@ -113,7 +113,7 @@ def scan_market():
         except:
             continue
 
-    # 计算板块轮动强度
+    # 板块轮动强度
     st.session_state.sector_strength = {}
     for sec,val in sector_stats.items():
         if val["count"]>0:
@@ -170,7 +170,8 @@ left_col,right_col = st.columns([1,2])
 with left_col:
     st.subheader("📊 板块轮动强度热力图")
     if st.session_state.sector_strength:
-        df_sector = pd.DataFrame([{"板块":sec,"轮动强度":round(val,2)} for sec,val in st.session_state.sector_strength.items()])
+        df_sector = pd.DataFrame([{"板块":sec,"轮动强度":round(val,2)} 
+                                  for sec,val in st.session_state.sector_strength.items()])
         df_sector = df_sector.sort_values("轮动强度",ascending=False)
         fig_sector = px.bar(df_sector, x="板块", y="轮动强度", color="轮动强度",
                             color_continuous_scale=px.colors.sequential.Viridis,
@@ -203,4 +204,5 @@ with right_col:
 if 9<=t.hour<=15:
     time.sleep(20)
     st.rerun()
+
 st.caption(f"🔒 决策锁定时间：{st.session_state.decision_time}")
