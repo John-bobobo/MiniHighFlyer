@@ -1,10 +1,21 @@
+import subprocess
+import sys
+
+# ======================
+# 自动安装 plotly
+# ======================
+try:
+    import plotly.express as px
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "plotly==5.17.0"])
+    import plotly.express as px
+
 import streamlit as st
 import requests
 import time
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-import plotly.express as px
 
 # ======================
 # 时间函数
@@ -63,7 +74,7 @@ def get_stock_concept(code):
         return "其他"
 
 # ======================
-# 扫描市场（更新候选池 & 板块强度 & 资金流）
+# 扫描市场
 # ======================
 def scan_market():
     data = get_market_data()
