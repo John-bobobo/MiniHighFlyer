@@ -11,28 +11,21 @@ from collections import defaultdict
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 5.2 | 日内积累锁定版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 5.3 | 板块趋势+龙头换手+资金博弈", layout="wide")
 
 # ======================
 # Session初始化
 # ======================
-if "candidate_pool" not in st.session_state:
-    st.session_state.candidate_pool = {}
-
-if "final_decision" not in st.session_state:
-    st.session_state.final_decision = None
-
-if "morning_decision" not in st.session_state:
-    st.session_state.morning_decision = None
-
-if "decision_locked" not in st.session_state:
-    st.session_state.decision_locked = False
-
-if "morning_locked" not in st.session_state:
-    st.session_state.morning_locked = False
-
-if "decision_time" not in st.session_state:
-    st.session_state.decision_time = ""
+for key, default in {
+    "candidate_pool": {},
+    "final_decision": None,
+    "morning_decision": None,
+    "decision_locked": False,
+    "morning_locked": False,
+    "decision_time": ""
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ======================
 # 获取市场数据
@@ -63,13 +56,15 @@ def get_stock_concept(code):
         return "其他"
 
 # ======================
-# 扫描市场（用于更新候选池）
+# 扫描市场（更新候选池 + 板块数据）
 # ======================
 def scan_market():
-
     data = get_market_data()
     if not data:
         return
+
+    # 板块累积数据
+    sector_stats = defaultdict(lambda: {"pct_sum": 0, "count": 0})
 
     for s in data:
         try:
@@ -87,11 +82,12 @@ def scan_market():
 
             concept = get_stock_concept(code)
 
+            # 🏦 资金博弈评分
             score = (
-                0.4 * pct +
-                0.3 * amount +
-                0.2 * turnover +
-                0.1 * (1 if pct > 5 else 0)
+                0.35 * pct +          # 涨幅
+                0.25 * amount +       # 成交额
+                0.25 * turnover +     # 换手率
+                0.15 * (1 if pct > 5 else 0)  # 极端拉升加分
             )
 
             # 累积更新逻辑（只升不降）
@@ -103,16 +99,30 @@ def scan_market():
                     "best_score": score,
                     "pct": pct,
                     "amount": amount,
+                    "turnover": turnover
                 }
             else:
                 if score > st.session_state.candidate_pool[code]["best_score"]:
-                    st.session_state.candidate_pool[code]["best_score"] = score
-                    st.session_state.candidate_pool[code]["price"] = price
-                    st.session_state.candidate_pool[code]["pct"] = pct
-                    st.session_state.candidate_pool[code]["amount"] = amount
+                    st.session_state.candidate_pool[code].update({
+                        "best_score": score,
+                        "price": price,
+                        "pct": pct,
+                        "amount": amount,
+                        "turnover": turnover
+                    })
+
+            # 板块累积
+            sector_stats[concept]["pct_sum"] += pct
+            sector_stats[concept]["count"] += 1
 
         except:
             continue
+
+    # 计算板块趋势强度
+    st.session_state.sector_strength = {}
+    for sec, val in sector_stats.items():
+        if val["count"] > 0:
+            st.session_state.sector_strength[sec] = val["pct_sum"] / val["count"]
 
 # ======================
 # 获取Top推荐
@@ -132,7 +142,7 @@ def get_top_candidate():
 # UI 主逻辑
 # ======================
 t = get_bj_time()
-st.title("🔥 尾盘博弈 5.2 | 日内积累锁定版")
+st.title("🔥 尾盘博弈 5.3 | 板块趋势+龙头换手+资金博弈")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
 # 时间判断
@@ -155,12 +165,23 @@ if after_1430 and not st.session_state.decision_locked:
     st.session_state.decision_locked = True
 
 # ======================
+# 显示板块趋势强度
+# ======================
+if hasattr(st.session_state, "sector_strength"):
+    st.subheader("📊 板块趋势强度")
+    df_sector = pd.DataFrame([
+        {"板块": sec, "平均涨幅": round(val, 2)}
+        for sec, val in st.session_state.sector_strength.items()
+    ])
+    st.dataframe(df_sector.sort_values("平均涨幅", ascending=False))
+
+# ======================
 # 显示上午虚拟推荐
 # ======================
 if st.session_state.morning_decision:
     st.info("🕚 上午虚拟推荐（观察用）")
     m = st.session_state.morning_decision
-    st.write(f"{m['name']} | 板块: {m['sector']} | 当前分数: {round(m['best_score'],2)}")
+    st.write(f"{m['name']} | 板块: {m['sector']} | 当前分数: {round(m['best_score'],2)} | 换手率: {round(m['turnover'],2)}% | 成交额: {round(m['amount'],2)} 亿")
 
 # ======================
 # 显示最终推荐
@@ -173,6 +194,8 @@ if st.session_state.final_decision:
     st.write(f"股票: {f['name']}")
     st.write(f"板块: {f['sector']}")
     st.write(f"尾盘价格: ¥{f['price']}")
+    st.write(f"换手率: {round(f['turnover'],2)}%")
+    st.write(f"成交额: {round(f['amount'],2)} 亿")
     st.write(f"建议仓位: {shares} 股")
 
 st.caption(f"🔒 决策锁定时间：{st.session_state.decision_time}")
