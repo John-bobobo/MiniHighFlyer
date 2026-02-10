@@ -6,33 +6,33 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 # ======================
-# 时间函数
+# 时间
 # ======================
 def get_bj_time():
     return datetime.now(timezone(timedelta(hours=8)))
 
-st.set_page_config(page_title="尾盘博弈 可视化增强版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 5.3 | 日内积累锁定版", layout="wide")
 
 # ======================
 # Session 初始化
 # ======================
-for key, default in {
-    "candidate_pool": {},
-    "final_decision": [],
-    "decision_locked": False,
-    "decision_time": "",
-    "sector_strength": {},
-    "flow_history": defaultdict(list)
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+if "candidate_pool" not in st.session_state:
+    st.session_state.candidate_pool = {}
+
+if "final_decision" not in st.session_state:
+    st.session_state.final_decision = None
+
+if "decision_locked" not in st.session_state:
+    st.session_state.decision_locked = False
+
+if "decision_time" not in st.session_state:
+    st.session_state.decision_time = ""
 
 TOTAL_FUNDS = 50000
 TOP_N = 5
-FLOW_HISTORY_LEN = 15
 
 # ======================
-# 获取市场数据（akshare版本）
+# 获取市场数据
 # ======================
 def get_market_data():
     try:
@@ -42,14 +42,13 @@ def get_market_data():
         return pd.DataFrame()
 
 # ======================
-# 扫描市场
+# 扫描市场（只累积，不重置）
 # ======================
 def scan_market():
+
     df = get_market_data()
     if df.empty:
         return
-
-    sector_stats = defaultdict(lambda: {"pct_sum":0,"amount_sum":0,"count":0})
 
     for _, row in df.iterrows():
         try:
@@ -63,8 +62,13 @@ def scan_market():
 
             sector = row["所属行业"] if "所属行业" in row else "其他"
 
-            score = 0.5*pct + 0.3*amount + 0.2*(1 if pct>5 else 0)
+            score = (
+                0.5 * pct +
+                0.3 * amount +
+                0.2 * (1 if pct > 5 else 0)
+            )
 
+            # 只升不降
             if code not in st.session_state.candidate_pool:
                 st.session_state.candidate_pool[code] = {
                     "name": row["名称"],
@@ -72,7 +76,7 @@ def scan_market():
                     "price": price,
                     "best_score": score,
                     "pct": pct,
-                    "amount": amount
+                    "amount": amount,
                 }
             else:
                 if score > st.session_state.candidate_pool[code]["best_score"]:
@@ -83,20 +87,8 @@ def scan_market():
                         "amount": amount
                     })
 
-            sector_stats[sector]["pct_sum"] += pct
-            sector_stats[sector]["amount_sum"] += amount
-            sector_stats[sector]["count"] += 1
-
         except:
             continue
-
-    # 板块强度
-    st.session_state.sector_strength = {}
-    for sec,val in sector_stats.items():
-        if val["count"] > 0:
-            st.session_state.sector_strength[sec] = (
-                val["pct_sum"]*0.6 + val["amount_sum"]*0.4
-            ) / val["count"]
 
 # ======================
 # 获取Top
@@ -105,50 +97,53 @@ def get_top_candidates(n=TOP_N):
     pool = st.session_state.candidate_pool
     if not pool:
         return []
-    sorted_list = sorted(pool.items(), key=lambda x:x[1]["best_score"], reverse=True)
+
+    sorted_list = sorted(
+        pool.items(),
+        key=lambda x: x[1]["best_score"],
+        reverse=True
+    )
+
     return [x[1] for x in sorted_list[:n]]
 
 # ======================
 # 仓位
 # ======================
 def calc_shares(stock):
-    shares = int(TOTAL_FUNDS / stock['price'] / 100) * 100
+    shares = int(TOTAL_FUNDS / stock["price"] / 100) * 100
     return max(shares, 100)
 
 # ======================
 # 主逻辑
 # ======================
 t = get_bj_time()
-st.title("🔥 尾盘博弈 可视化增强版")
+st.title("🔥 尾盘博弈 5.3 | 日内积累锁定版")
 st.markdown(f"当前时间：{t.strftime('%H:%M:%S')}")
 
-if 9 <= t.hour <= 15:
+before_1430 = (t.hour < 14) or (t.hour == 14 and t.minute < 30)
+after_1430 = not before_1430
+
+# 白天持续扫描
+if before_1430 and not st.session_state.decision_locked:
     scan_market()
 
-if t.hour == 14 and t.minute >= 30 and not st.session_state.decision_locked:
+# 14:30 锁定
+if after_1430 and not st.session_state.decision_locked:
     st.session_state.final_decision = get_top_candidates()
-    st.session_state.decision_time = t.strftime('%Y-%m-%d %H:%M:%S')
+    st.session_state.decision_time = t.strftime("%Y-%m-%d %H:%M:%S")
     st.session_state.decision_locked = True
 
 # ======================
 # UI
 # ======================
-left_col, right_col = st.columns([1,2])
+left, right = st.columns([1,2])
 
-with left_col:
-    st.subheader("📊 板块轮动强度")
-    if st.session_state.sector_strength:
-        df_sector = pd.DataFrame([
-            {"板块":sec,"强度":round(val,2)}
-            for sec,val in st.session_state.sector_strength.items()
-        ])
-        df_sector = df_sector.sort_values("强度",ascending=False)
-        st.bar_chart(df_sector.set_index("板块"))
-    else:
-        st.info("暂无板块数据")
+with left:
+    st.subheader("📊 候选池规模")
+    st.metric("候选股票数量", len(st.session_state.candidate_pool))
 
-with right_col:
-    st.subheader(f"🎯 尾盘Top {TOP_N}组合")
+with right:
+    st.subheader(f"🎯 14:30 尾盘锁定 Top {TOP_N}")
 
     if st.session_state.final_decision:
         for f in st.session_state.final_decision:
@@ -161,9 +156,8 @@ with right_col:
                 f"建议仓位: {shares} 股"
             )
     else:
-        st.info("14:30后自动生成尾盘组合")
+        st.info("等待 14:30 自动锁定结果")
 
-st.caption(f"候选池数量：{len(st.session_state.candidate_pool)}")
 st.caption(f"🔒 决策锁定时间：{st.session_state.decision_time}")
 
 # 自动刷新
