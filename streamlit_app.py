@@ -6,12 +6,9 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import warnings
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.1 真实数据版·多源稳定", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版", layout="wide")
 
 tz = pytz.timezone("Asia/Shanghai")
 
@@ -51,6 +48,10 @@ if "last_data_fetch_time" not in st.session_state:
 if "data_fetch_attempts" not in st.session_state:
     st.session_state.data_fetch_attempts = 0
 
+# 新增：用于缓存A股代码列表
+if "a_code_list" not in st.session_state:
+    st.session_state.a_code_list = None
+
 
 # ===============================
 # 日志记录函数
@@ -67,36 +68,44 @@ def add_log(event, details):
 
 
 # ===============================
-# 多数据源稳定获取模块（永不降级）
+# 交易时间判断（精确）
 # ===============================
+def is_trading_day_and_time(now=None):
+    if now is None:
+        now = datetime.now(tz)
+    weekday = now.weekday()
+    hour = now.hour
+    minute = now.minute
+    if weekday >= 5:
+        return False, "周末休市"
+    # 上午 9:30 - 11:30
+    if (hour == 9 and minute >= 30) or (10 <= hour < 11) or (hour == 11 and minute <= 30):
+        return True, "交易时间"
+    # 下午 13:00 - 15:00
+    if (13 <= hour < 15) or (hour == 15 and minute == 0):
+        return True, "交易时间"
+    return False, "非交易时间"
 
-def create_requests_session():
-    """创建带重试策略的会话（仅为自定义请求保留，不强制注入akshare）"""
-    session = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    session.timeout = (10, 30)
-    return session
 
-
-# 创建会话但不强制绑定到akshare（akshare无此方法）
-_requests_session = create_requests_session()
-# 注意：akshare 旧版本不支持 ak.session()，已删除该行
-
-
+# ===============================
+# 获取A股代码列表（稳定接口，不依赖实时行情）
+# ===============================
 @st.cache_data(ttl=3600)
-def get_all_a_codes():
-    """获取所有A股代码（用于新浪接口）"""
+def get_all_a_codes_stable():
+    """使用 stock_info_a_code_name 获取所有A股代码，非常稳定"""
     try:
-        df = ak.stock_zh_a_spot_em()
-        codes = df['代码'].tolist()[:2000]
+        df = ak.stock_info_a_code_name()
+        codes = df['code'].tolist()
+        add_log("代码获取", f"成功获取 {len(codes)} 个A股代码")
         return codes
-    except:
+    except Exception as e:
+        add_log("代码获取", f"失败: {str(e)}")
         return []
 
 
+# ===============================
+# 新浪数据标准化
+# ===============================
 def standardize_sina_df(df):
     """新浪财经数据标准化"""
     df = df.rename(columns={
@@ -107,143 +116,101 @@ def standardize_sina_df(df):
         'volume': '成交量',
         'turnover': '成交额'
     })
-    df['所属行业'] = '未知'
+    df['所属行业'] = '未知'  # 新浪无行业字段
     return df
 
 
-def standardize_columns(df):
-    """统一各数据源列名"""
-    column_map = {
-        '代码': ['代码', 'symbol', 'code'],
-        '名称': ['名称', 'name'],
-        '涨跌幅': ['涨跌幅', 'changepercent', '涨幅'],
-        '成交额': ['成交额', 'turnover', 'amount'],
-        '所属行业': ['所属行业', '行业', 'industry'],
-        '换手率': ['换手率', 'turnoverratio'],
-        '最新价': ['最新价', 'price', 'close'],
-        '成交量': ['成交量', 'volume'],
-    }
-    for std_name, possible in column_map.items():
-        if std_name not in df.columns:
-            for col in possible:
-                if col in df.columns:
-                    df.rename(columns={col: std_name}, inplace=True)
-                    break
-    return df
-
-
+# ===============================
+# 数据获取核心（双源稳定策略，移除不存在接口）
+# ===============================
 def fetch_realtime_data():
     """
-    核心多源获取：依次尝试多个真实数据源，直至成功
+    策略：
+    1. 优先尝试东方财富（stock_zh_a_spot_em）
+    2. 若失败，则使用新浪财经（stock_sina_realtime），代码列表提前缓存
     返回标准化DataFrame，必须包含：代码、名称、涨跌幅、成交额、所属行业
     """
     errors = []
-    data_sources = [
-        ("stock_zh_a_spot_em", {}),      # 东方财富主接口
-        ("stock_other_spot_em", {}),     # 东方财富备用接口
-        ("stock_sina_realtime", {}),     # 新浪财经
-        ("stock_baidu_em", {}),          # 百度接口
-    ]
 
-    for source_name, params in data_sources:
-        try:
-            add_log("数据源尝试", f"正在尝试 {source_name}")
-            df = None
-
-            if source_name == "stock_zh_a_spot_em":
-                df = ak.stock_zh_a_spot_em()
-            elif source_name == "stock_other_spot_em":
-                df = ak.stock_other_spot_em()
-            elif source_name == "stock_sina_realtime":
-                codes = get_all_a_codes()
-                if not codes:
-                    continue
-                # 新浪接口最多一次1000，分批获取
-                batch_size = 800
-                df_list = []
-                for i in range(0, len(codes), batch_size):
-                    batch = codes[i:i + batch_size]
-                    part = ak.stock_sina_realtime(code=batch)
-                    df_list.append(part)
-                    time.sleep(0.5)
-                df = pd.concat(df_list, ignore_index=True)
-                df = standardize_sina_df(df)
-            elif source_name == "stock_baidu_em":
-                df = ak.stock_baidu_em()
-
-            if df is None or df.empty:
-                errors.append(f"{source_name}: 空数据")
-                continue
-            if len(df) < 100:
-                errors.append(f"{source_name}: 数据量不足 {len(df)}")
-                continue
-
-            df = standardize_columns(df)
+    # ---------- 1. 尝试东方财富 ----------
+    try:
+        add_log("数据源", "尝试 东方财富 stock_zh_a_spot_em")
+        df = ak.stock_zh_a_spot_em()
+        if df is not None and not df.empty and len(df) > 100:
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
             if all(col in df.columns for col in required):
-                add_log("数据源成功", f"{source_name} 成功，获取 {len(df)} 条")
+                add_log("数据源", "东方财富 成功")
                 return df
             else:
                 missing = [c for c in required if c not in df.columns]
-                errors.append(f"{source_name}: 缺失字段 {missing}")
-        except Exception as e:
-            errors.append(f"{source_name}: {str(e)[:50]}")
-            continue
+                errors.append(f"东方财富: 缺失字段 {missing}")
+        else:
+            errors.append(f"东方财富: 数据无效 (长度 {len(df) if df is not None else 0})")
+    except Exception as e:
+        errors.append(f"东方财富: {str(e)[:50]}")
 
-    # 所有源均失败，抛出异常（绝不返回示例数据）
-    raise Exception(f"所有数据源均无法获取实时数据: {'; '.join(errors)}")
+    # ---------- 2. 尝试新浪财经 ----------
+    try:
+        add_log("数据源", "尝试 新浪财经 stock_sina_realtime")
+        # 获取代码列表（优先使用session缓存）
+        codes = st.session_state.a_code_list
+        if codes is None:
+            codes = get_all_a_codes_stable()
+            st.session_state.a_code_list = codes
+        if not codes:
+            errors.append("新浪财经: 无法获取股票代码列表")
+            raise Exception("无代码列表")
+
+        # 分批请求（新浪单次最多800）
+        batch_size = 800
+        df_list = []
+        for i in range(0, len(codes), batch_size):
+            batch = codes[i:i + batch_size]
+            part = ak.stock_sina_realtime(code=batch)
+            df_list.append(part)
+            time.sleep(0.3)  # 避免请求过快
+        df = pd.concat(df_list, ignore_index=True)
+
+        # 标准化
+        df = standardize_sina_df(df)
+
+        # 确保只保留需要的列
+        df = df[['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']]
+
+        required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+        if all(col in df.columns for col in required) and len(df) > 100:
+            add_log("数据源", "新浪财经 成功")
+            return df
+        else:
+            errors.append(f"新浪财经: 数据无效 (长度 {len(df)})")
+    except Exception as e:
+        errors.append(f"新浪财经: {str(e)[:50]}")
+
+    # ---------- 全部失败 ----------
+    raise Exception("所有数据源均失败: " + "; ".join(errors))
 
 
-def is_trading_day_and_time(now=None):
-    """精确判断是否在交易时间内（考虑集合竞价等，只取连续竞价）"""
-    if now is None:
-        now = datetime.now(tz)
-    weekday = now.weekday()
-    hour = now.hour
-    minute = now.minute
-
-    if weekday >= 5:
-        return False, "周末休市"
-
-    # 上午 9:30 - 11:30
-    if (hour == 9 and minute >= 30) or (10 <= hour < 11) or (hour == 11 and minute <= 30):
-        return True, "交易时间"
-    # 下午 13:00 - 15:00
-    if (13 <= hour < 15) or (hour == 15 and minute == 0):
-        return True, "交易时间"
-
-    return False, "非交易时间"
-
-
+# ===============================
+# 对外稳定获取接口（带缓存）
+# ===============================
 def get_stable_realtime_data():
-    """
-    对外暴露的唯一数据获取接口
-    - 优先返回今日缓存
-    - 交易时间：多源获取，全部失败则报错
-    - 非交易时间：有缓存则返回缓存，无缓存则报错
-    - 永不降级到示例数据
-    """
     now = datetime.now(tz)
 
     # 1. 有今日缓存直接返回
     if st.session_state.today_real_data is not None:
         st.session_state.data_source = "cached_real_data"
         st.session_state.last_data_fetch_time = now
-        add_log("数据获取", "使用今日缓存数据")
+        add_log("数据", "使用今日缓存")
         return st.session_state.today_real_data
 
-    # 2. 判断交易状态
+    # 2. 判断交易时间
     is_trading, msg = is_trading_day_and_time(now)
-
     if not is_trading:
-        # 非交易时间且无缓存 → 无法获取新数据
-        raise Exception(f"{msg}，且无今日缓存数据，无法获取实时行情")
+        raise Exception(f"{msg}，且无缓存数据")
 
-    # 3. 交易时间 → 尝试多源获取
-    add_log("数据获取", "开始多源实时数据获取")
+    # 3. 获取新数据
+    add_log("数据", "开始获取实时数据")
     df = fetch_realtime_data()
-
-    # 4. 缓存并返回
     st.session_state.today_real_data = df.copy()
     st.session_state.data_source = "real_data"
     st.session_state.last_data_fetch_time = now
@@ -251,7 +218,7 @@ def get_stable_realtime_data():
 
 
 # ===============================
-# 多因子选股引擎
+# 多因子选股引擎（与您原有代码完全一致）
 # ===============================
 def get_technical_indicators(df):
     """模拟技术因子（实际项目应从历史数据计算）"""
@@ -317,7 +284,7 @@ def calculate_composite_score(df, sector_avg_change, weights):
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.1 · 多源稳定版")
+st.title("🔥 尾盘博弈 6.1 · 云稳定版")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -328,6 +295,7 @@ if st.session_state.today != now.date():
     st.session_state.today_real_data = None
     st.session_state.data_source = "unknown"
     st.session_state.data_fetch_attempts = 0
+    st.session_state.a_code_list = None  # 清空代码缓存
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
@@ -360,6 +328,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.session_state.today_real_data = None
         st.session_state.data_source = "unknown"
+        st.session_state.a_code_list = None  # 同时清除代码缓存
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
         st.rerun()
@@ -434,6 +403,7 @@ with st.sidebar:
         if st.button("清除今日缓存"):
             st.session_state.today_real_data = None
             st.session_state.data_source = "unknown"
+            st.session_state.a_code_list = None
             st.success("已清除今日数据缓存")
             st.rerun()
 
@@ -538,11 +508,12 @@ except Exception as e:
         st.cache_data.clear()
         st.session_state.today_real_data = None
         st.session_state.data_source = "unknown"
+        st.session_state.a_code_list = None
         st.rerun()
     st.stop()
 
 # ===============================
-# 板块分析与选股
+# 板块分析与选股（与您原有代码完全一致）
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
