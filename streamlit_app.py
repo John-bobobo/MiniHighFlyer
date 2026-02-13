@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+"""
+尾盘博弈 6.1 · 云稳定版（Tushare 付费版）
+====================================
+✅ 数据源优先级：
+   1. Tushare pro.realtime_list（你已购买“A股日线RT”）
+   2. 东方财富 stock_zh_a_spot_em（AKShare）
+   3. 新浪财经 stock_sina_realtime（AKShare，分批+缓存）
+✅ 全自动尾盘推荐与锁定（13:30-14:00 首推，14:30 后锁定）
+✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
+✅ 仅需填写你的 Tushare token，零额外修改
+"""
+
 import streamlit as st
 import akshare as ak
 import pandas as pd
@@ -6,52 +19,47 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import warnings
+import tushare as ts                     # 👈 新增：导入 Tushare
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版（Tushare）", layout="wide")
 
+# ===============================
+# 🔑 关键：你的 Tushare Token（请务必填写正确）
+# ===============================
+TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的 token ← ← ←
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()                      # 全局 Tushare pro 接口
+
+# ===============================
+# 时区与 Session 初始化（保持不变）
+# ===============================
 tz = pytz.timezone("Asia/Shanghai")
 
-# ===============================
-# Session 初始化
-# ===============================
 if "candidate_pick_history" not in st.session_state:
     st.session_state.candidate_pick_history = []
-
 if "morning_pick" not in st.session_state:
     st.session_state.morning_pick = None
-
 if "final_pick" not in st.session_state:
     st.session_state.final_pick = None
-
 if "locked" not in st.session_state:
     st.session_state.locked = False
-
 if "today" not in st.session_state:
     st.session_state.today = datetime.now(tz).date()
-
 if "logs" not in st.session_state:
     st.session_state.logs = []
-
 if "backtest_results" not in st.session_state:
     st.session_state.backtest_results = None
-
 if "today_real_data" not in st.session_state:
     st.session_state.today_real_data = None
-
 if "data_source" not in st.session_state:
     st.session_state.data_source = "unknown"
-
 if "last_data_fetch_time" not in st.session_state:
     st.session_state.last_data_fetch_time = None
-
 if "data_fetch_attempts" not in st.session_state:
     st.session_state.data_fetch_attempts = 0
-
-# 新增：用于缓存A股代码列表
 if "a_code_list" not in st.session_state:
     st.session_state.a_code_list = None
-
 
 # ===============================
 # 日志记录函数
@@ -66,7 +74,6 @@ def add_log(event, details):
     if len(st.session_state.logs) > 30:
         st.session_state.logs = st.session_state.logs[-30:]
 
-
 # ===============================
 # 交易时间判断（精确）
 # ===============================
@@ -78,21 +85,17 @@ def is_trading_day_and_time(now=None):
     minute = now.minute
     if weekday >= 5:
         return False, "周末休市"
-    # 上午 9:30 - 11:30
     if (hour == 9 and minute >= 30) or (10 <= hour < 11) or (hour == 11 and minute <= 30):
         return True, "交易时间"
-    # 下午 13:00 - 15:00
     if (13 <= hour < 15) or (hour == 15 and minute == 0):
         return True, "交易时间"
     return False, "非交易时间"
 
-
 # ===============================
-# 获取A股代码列表（稳定接口，不依赖实时行情）
+# 获取A股代码列表（稳定接口，备胎新浪用）
 # ===============================
 @st.cache_data(ttl=3600)
 def get_all_a_codes_stable():
-    """使用 stock_info_a_code_name 获取所有A股代码，非常稳定"""
     try:
         df = ak.stock_info_a_code_name()
         codes = df['code'].tolist()
@@ -102,12 +105,10 @@ def get_all_a_codes_stable():
         add_log("代码获取", f"失败: {str(e)}")
         return []
 
-
 # ===============================
 # 新浪数据标准化
 # ===============================
 def standardize_sina_df(df):
-    """新浪财经数据标准化"""
     df = df.rename(columns={
         'symbol': '代码',
         'name': '名称',
@@ -116,30 +117,61 @@ def standardize_sina_df(df):
         'volume': '成交量',
         'turnover': '成交额'
     })
-    df['所属行业'] = '未知'  # 新浪无行业字段
+    df['所属行业'] = '未知'
     return df
 
-
 # ===============================
-# 数据获取核心（双源稳定策略，移除不存在接口）
+# 🚀 数据获取核心（Tushare 优先 + 双备胎）
 # ===============================
 def fetch_realtime_data():
     """
-    策略：
-    1. 优先尝试东方财富（stock_zh_a_spot_em）
-    2. 若失败，则使用新浪财经（stock_sina_realtime），代码列表提前缓存
-    返回标准化DataFrame，必须包含：代码、名称、涨跌幅、成交额、所属行业
+    返回标准化 DataFrame，必须包含：代码、名称、涨跌幅、成交额、所属行业
     """
     errors = []
 
-    # ---------- 1. 尝试东方财富 ----------
+    # ---------- 1. Tushare 实时行情（你已购买，最快最稳）----------
+    try:
+        add_log("数据源", "尝试 Tushare pro.realtime_list")
+        # 获取全市场实时行情（日线RT）
+        df = pro.realtime_list(fields='ts_code,name,price,涨跌幅,vol,amount,turnover_rate,振幅,circ_mv')
+        if df is not None and not df.empty and len(df) > 100:
+            # 标准化列名，以兼容后续处理
+            df = df.rename(columns={
+                'ts_code': '代码',
+                'name': '名称',
+                'price': '最新价',
+                '涨跌幅': '涨跌幅',
+                'vol': '成交量',
+                'amount': '成交额',
+                'turnover_rate': '换手率',
+                '振幅': '振幅',
+                'circ_mv': '流通市值'
+            })
+            # Tushare 无行业字段，先填“未知”，不影响选股（板块分析会弱化）
+            df['所属行业'] = '未知'
+            required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+            if all(col in df.columns for col in required):
+                add_log("数据源", "✅ Tushare 实时行情 成功")
+                # 只保留下游需要的列，避免意外
+                keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '换手率', '振幅', '流通市值']
+                keep_cols = [c for c in keep_cols if c in df.columns]
+                return df[keep_cols]
+            else:
+                missing = [c for c in required if c not in df.columns]
+                errors.append(f"Tushare: 缺失字段 {missing}")
+        else:
+            errors.append(f"Tushare: 数据无效 (长度 {len(df) if df is not None else 0})")
+    except Exception as e:
+        errors.append(f"Tushare: {str(e)[:50]}")
+
+    # ---------- 2. 东方财富（备胎1）----------
     try:
         add_log("数据源", "尝试 东方财富 stock_zh_a_spot_em")
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty and len(df) > 100:
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
             if all(col in df.columns for col in required):
-                add_log("数据源", "东方财富 成功")
+                add_log("数据源", "✅ 东方财富 成功")
                 return df
             else:
                 missing = [c for c in required if c not in df.columns]
@@ -149,10 +181,9 @@ def fetch_realtime_data():
     except Exception as e:
         errors.append(f"东方财富: {str(e)[:50]}")
 
-    # ---------- 2. 尝试新浪财经 ----------
+    # ---------- 3. 新浪财经（备胎2）----------
     try:
         add_log("数据源", "尝试 新浪财经 stock_sina_realtime")
-        # 获取代码列表（优先使用session缓存）
         codes = st.session_state.a_code_list
         if codes is None:
             codes = get_all_a_codes_stable()
@@ -161,25 +192,19 @@ def fetch_realtime_data():
             errors.append("新浪财经: 无法获取股票代码列表")
             raise Exception("无代码列表")
 
-        # 分批请求（新浪单次最多800）
         batch_size = 800
         df_list = []
         for i in range(0, len(codes), batch_size):
             batch = codes[i:i + batch_size]
             part = ak.stock_sina_realtime(code=batch)
             df_list.append(part)
-            time.sleep(0.3)  # 避免请求过快
+            time.sleep(0.3)
         df = pd.concat(df_list, ignore_index=True)
-
-        # 标准化
         df = standardize_sina_df(df)
-
-        # 确保只保留需要的列
         df = df[['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']]
-
         required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
         if all(col in df.columns for col in required) and len(df) > 100:
-            add_log("数据源", "新浪财经 成功")
+            add_log("数据源", "✅ 新浪财经 成功")
             return df
         else:
             errors.append(f"新浪财经: 数据无效 (长度 {len(df)})")
@@ -189,26 +214,21 @@ def fetch_realtime_data():
     # ---------- 全部失败 ----------
     raise Exception("所有数据源均失败: " + "; ".join(errors))
 
-
 # ===============================
 # 对外稳定获取接口（带缓存）
 # ===============================
 def get_stable_realtime_data():
     now = datetime.now(tz)
-
-    # 1. 有今日缓存直接返回
     if st.session_state.today_real_data is not None:
         st.session_state.data_source = "cached_real_data"
         st.session_state.last_data_fetch_time = now
         add_log("数据", "使用今日缓存")
         return st.session_state.today_real_data
 
-    # 2. 判断交易时间
     is_trading, msg = is_trading_day_and_time(now)
     if not is_trading:
         raise Exception(f"{msg}，且无缓存数据")
 
-    # 3. 获取新数据
     add_log("数据", "开始获取实时数据")
     df = fetch_realtime_data()
     st.session_state.today_real_data = df.copy()
@@ -216,9 +236,8 @@ def get_stable_realtime_data():
     st.session_state.last_data_fetch_time = now
     return df
 
-
 # ===============================
-# 多因子选股引擎（与您原有代码完全一致）
+# 多因子选股引擎（与你原有代码完全一致）
 # ===============================
 def get_technical_indicators(df):
     """模拟技术因子（实际项目应从历史数据计算）"""
@@ -239,7 +258,6 @@ def get_technical_indicators(df):
             df_factor.at[stock_idx, '量比'] = 1.0 + np.random.uniform(-0.5, 1.0)
     return df_factor
 
-
 def filter_stocks_by_rule(df):
     """硬性规则过滤"""
     if df.empty:
@@ -256,7 +274,6 @@ def filter_stocks_by_rule(df):
     if '换手率' in filtered.columns:
         filtered = filtered[(filtered['换手率'] > 0.5) & (filtered['换手率'] < 50)]
     return filtered
-
 
 def calculate_composite_score(df, sector_avg_change, weights):
     """多因子综合评分"""
@@ -279,12 +296,11 @@ def calculate_composite_score(df, sector_avg_change, weights):
     df_scored['风险调整得分'] = df_scored['综合得分'] - risk_penalty
     return df_scored.sort_values('风险调整得分', ascending=False)
 
-
 # ===============================
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.1 · 云稳定版")
+st.title("🔥 尾盘博弈 6.1 · 云稳定版（Tushare 付费版）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -295,18 +311,18 @@ if st.session_state.today != now.date():
     st.session_state.today_real_data = None
     st.session_state.data_source = "unknown"
     st.session_state.data_fetch_attempts = 0
-    st.session_state.a_code_list = None  # 清空代码缓存
+    st.session_state.a_code_list = None
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
 # ===============================
-# 侧边栏 - 控制面板
+# 侧边栏 - 控制面板（与你原有代码完全一致，仅增加 Tushare 标识）
 # ===============================
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
     data_source_display = {
-        "real_data": "🟢 **实时数据**",
+        "real_data": "🟢 **实时数据（Tushare）**",
         "cached_real_data": "🟡 **缓存数据**",
         "unknown": "⚪ **等待获取**",
         "failed": "🔴 **获取失败**"
@@ -328,7 +344,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.session_state.today_real_data = None
         st.session_state.data_source = "unknown"
-        st.session_state.a_code_list = None  # 同时清除代码缓存
+        st.session_state.a_code_list = None
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
         st.rerun()
@@ -456,16 +472,16 @@ with col4:
         st.metric("自动刷新", "30秒")
 
 # ===============================
-# 获取市场数据（核心调用）- 永不降级
+# 🚀 获取市场数据（核心调用）- 永不降级
 # ===============================
 st.markdown("### 📊 数据获取状态")
 try:
-    with st.spinner("正在从多个数据源获取真实市场数据..."):
+    with st.spinner("正在从 Tushare 获取实时数据..."):
         df = get_stable_realtime_data()
     
     # 数据源状态横幅
     data_source_status = {
-        "real_data": ("✅", "实时行情数据", "#e6f7ff"),
+        "real_data": ("✅", "Tushare 实时行情", "#e6f7ff"),
         "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
         "unknown": ("⚪", "等待获取数据", "#f0f0f0"),
         "failed": ("🔴", "数据获取失败", "#ffe6e6")
@@ -482,14 +498,17 @@ try:
     if not df.empty:
         st.success(f"✅ 成功获取 {len(df)} 条真实股票数据")
         with st.expander("🔍 查看数据样本"):
-            st.dataframe(df[['代码', '名称', '涨跌幅', '成交额', '所属行业']].head(10))
+            display_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+            display_cols = [c for c in display_cols if c in df.columns]
+            st.dataframe(df[display_cols].head(10))
             col_stat1, col_stat2, col_stat3 = st.columns(3)
             with col_stat1:
                 st.metric("平均涨幅", f"{df['涨跌幅'].mean():.2f}%")
             with col_stat2:
                 st.metric("最高涨幅", f"{df['涨跌幅'].max():.2f}%")
             with col_stat3:
-                st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
+                if '成交额' in df.columns:
+                    st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
     else:
         st.error("❌ 获取到的数据为空")
         st.stop()
@@ -499,10 +518,11 @@ except Exception as e:
     with st.expander("🔧 故障排除指南"):
         st.markdown("""
         ### 所有数据源均无法获取实时数据，可能原因：
-        - **当前非交易时间**：实时行情只在交易时段（9:30-11:30, 13:00-15:00）提供
-        - **网络环境限制**：某些服务器/IP可能被数据源封禁
-        - **AKShare版本过旧**：请执行 `pip install akshare --upgrade`
-        - **防火墙/代理问题**：检查网络设置
+        - **Tushare token 错误或未填写** → 请检查代码开头的 `TUSHARE_TOKEN`
+        - **Tushare 权限不足** → 确认已购买“A股日线RT”且积分足够
+        - **当前非交易时间** → 实时行情只在交易时段（9:30-11:30, 13:00-15:00）提供
+        - **网络环境限制** → 某些服务器/IP 可能被数据源封禁
+        - **AKShare 版本过旧** → 执行 `pip install akshare --upgrade`
         """)
     if st.button("🔄 立即重试"):
         st.cache_data.clear()
@@ -513,7 +533,7 @@ except Exception as e:
     st.stop()
 
 # ===============================
-# 板块分析与选股（与您原有代码完全一致）
+# 板块分析与选股（与你原有代码完全一致）
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
@@ -704,7 +724,7 @@ with col_rec1:
     st.subheader("🕐 首次推荐 (13:30-14:00)")
     if st.session_state.morning_pick is not None:
         pick = st.session_state.morning_pick
-        data_source_tag = {"real_data": "🟢 实时数据", "cached_real_data": "🟡 缓存数据"}.get(pick.get('data_source', ''), '')
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
         st.markdown(f"""
         <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
             <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
@@ -736,7 +756,7 @@ with col_rec2:
     st.subheader("🎯 最终锁定 (14:30后)")
     if st.session_state.final_pick is not None:
         pick = st.session_state.final_pick
-        data_source_tag = {"real_data": "🟢 实时数据", "cached_real_data": "🟡 缓存数据"}.get(pick.get('data_source', ''), '')
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
         st.markdown(f"""
         <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
             <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
