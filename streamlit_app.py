@@ -3,7 +3,7 @@
 尾盘博弈 6.1 · 云稳定版（Tushare 付费版）
 ====================================
 ✅ 数据源优先级：
-   1. Tushare pro.realtime_list（你已购买“A股日线RT”）
+   1. Tushare pro.realtime（你已购买“A股日线RT”）—— 已修正接口名
    2. 东方财富 stock_zh_a_spot_em（AKShare）
    3. 新浪财经 stock_sina_realtime（AKShare，分批+缓存）
 ✅ 全自动尾盘推荐与锁定（13:30-14:00 首推，14:30 后锁定）
@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import warnings
-import tushare as ts                     # 👈 新增：导入 Tushare
+import tushare as ts
 
 warnings.filterwarnings('ignore')
 st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版（Tushare）", layout="wide")
@@ -27,12 +27,12 @@ st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版（Tushare）", l
 # ===============================
 # 🔑 关键：你的 Tushare Token（请务必填写正确）
 # ===============================
-TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的 token ← ← ←
+TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的40位token ← ← ←
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()                      # 全局 Tushare pro 接口
 
 # ===============================
-# 时区与 Session 初始化（保持不变）
+# 时区与 Session 初始化
 # ===============================
 tz = pytz.timezone("Asia/Shanghai")
 
@@ -131,28 +131,28 @@ def fetch_realtime_data():
 
     # ---------- 1. Tushare 实时行情（你已购买，最快最稳）----------
     try:
-        add_log("数据源", "尝试 Tushare pro.realtime_list")
-        # 获取全市场实时行情（日线RT）
-        df = pro.realtime_list(fields='ts_code,name,price,涨跌幅,vol,amount,turnover_rate,振幅,circ_mv')
+        add_log("数据源", "尝试 Tushare pro.realtime")
+        # ✅ 正确接口名：realtime()，不需要传任何参数
+        df = pro.realtime()
         if df is not None and not df.empty and len(df) > 100:
             # 标准化列名，以兼容后续处理
             df = df.rename(columns={
                 'ts_code': '代码',
                 'name': '名称',
                 'price': '最新价',
-                '涨跌幅': '涨跌幅',
+                'pct_chg': '涨跌幅',      # Tushare 涨跌幅字段是 pct_chg（百分比，已乘100）
                 'vol': '成交量',
                 'amount': '成交额',
                 'turnover_rate': '换手率',
-                '振幅': '振幅',
+                'amplitude': '振幅',
                 'circ_mv': '流通市值'
             })
-            # Tushare 无行业字段，先填“未知”，不影响选股（板块分析会弱化）
+            # Tushare 无行业字段，先填“未知”
             df['所属行业'] = '未知'
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
             if all(col in df.columns for col in required):
                 add_log("数据源", "✅ Tushare 实时行情 成功")
-                # 只保留下游需要的列，避免意外
+                # 只保留下游需要的列
                 keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '换手率', '振幅', '流通市值']
                 keep_cols = [c for c in keep_cols if c in df.columns]
                 return df[keep_cols]
@@ -162,7 +162,7 @@ def fetch_realtime_data():
         else:
             errors.append(f"Tushare: 数据无效 (长度 {len(df) if df is not None else 0})")
     except Exception as e:
-        errors.append(f"Tushare: {str(e)[:50]}")
+        errors.append(f"Tushare: {str(e)[:100]}")   # 延长错误信息长度，便于排查
 
     # ---------- 2. 东方财富（备胎1）----------
     try:
@@ -316,7 +316,7 @@ if st.session_state.today != now.date():
     st.rerun()
 
 # ===============================
-# 侧边栏 - 控制面板（与你原有代码完全一致，仅增加 Tushare 标识）
+# 侧边栏 - 控制面板
 # ===============================
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
@@ -533,7 +533,7 @@ except Exception as e:
     st.stop()
 
 # ===============================
-# 板块分析与选股（与你原有代码完全一致）
+# 板块分析与选股
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
@@ -673,7 +673,7 @@ else:
         top_candidate = None
 
 # ===============================
-# 自动推荐（仅当数据源为真实数据）
+# 自动推荐
 # ===============================
 st.markdown("### 🤖 自动推荐系统")
 use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
