@@ -16,7 +16,7 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import warnings
 import tushare as ts
@@ -69,9 +69,6 @@ if "data_fetch_attempts" not in st.session_state:
 if "a_code_list" not in st.session_state:
     st.session_state.a_code_list = None
 
-# ===============================
-# 日志记录函数
-# ===============================
 def add_log(event, details):
     log_entry = {
         'timestamp': datetime.now(tz).strftime("%H:%M:%S"),
@@ -82,9 +79,6 @@ def add_log(event, details):
     if len(st.session_state.logs) > 30:
         st.session_state.logs = st.session_state.logs[-30:]
 
-# ===============================
-# 交易时间判断（精确）
-# ===============================
 def is_trading_day_and_time(now=None):
     if now is None:
         now = datetime.now(tz)
@@ -99,9 +93,6 @@ def is_trading_day_and_time(now=None):
         return True, "交易时间"
     return False, "非交易时间"
 
-# ===============================
-# 获取A股代码列表（稳定接口，备胎新浪用）
-# ===============================
 @st.cache_data(ttl=3600)
 def get_all_a_codes_stable():
     try:
@@ -113,9 +104,6 @@ def get_all_a_codes_stable():
         add_log("代码获取", f"失败: {str(e)}")
         return []
 
-# ===============================
-# 新浪数据标准化
-# ===============================
 def standardize_sina_df(df):
     df = df.rename(columns={
         'symbol': '代码',
@@ -128,21 +116,13 @@ def standardize_sina_df(df):
     df['所属行业'] = '未知'
     return df
 
-# ===============================
-# 🚀 数据获取核心（Tushare 优先 + 双备胎）- 优化容错
-# ===============================
 def fetch_realtime_data():
-    """
-    返回标准化 DataFrame，必须包含：代码、名称、涨跌幅、成交额、所属行业
-    """
     errors = []
-
-    # ---------- 1. Tushare 实时行情（你已购买，最快最稳）----------
+    # ---------- 1. Tushare 实时行情 ----------
     try:
         add_log("数据源", "尝试 Tushare pro.realtime")
-        df = pro.realtime()  # 正确接口，无参数
+        df = pro.realtime()  # ✅ 唯一正确接口
         if df is not None and not df.empty:
-            # 标准化列名
             rename_map = {
                 'ts_code': '代码',
                 'name': '名称',
@@ -154,33 +134,24 @@ def fetch_realtime_data():
                 'amplitude': '振幅',
                 'circ_mv': '流通市值'
             }
-            # 仅重命名存在的列
             rename_cols = {k: v for k, v in rename_map.items() if k in df.columns}
             df = df.rename(columns=rename_cols)
-            
-            # 补充缺失的必需字段
-            if '所属行业' not in df.columns:
-                df['所属行业'] = '未知'
-            if '涨跌幅' not in df.columns and 'pct_chg' not in df.columns:
-                # 极端情况，尝试从其他字段计算
-                df['涨跌幅'] = 0.0
-            
+            df['所属行业'] = '未知'
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
             missing = [c for c in required if c not in df.columns]
             if not missing:
                 add_log("数据源", f"✅ Tushare 实时行情 成功 (共 {len(df)} 条)")
-                # 保留下游需要的列
                 keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '换手率', '振幅', '流通市值']
                 keep_cols = [c for c in keep_cols if c in df.columns]
                 return df[keep_cols]
             else:
                 errors.append(f"Tushare: 缺失字段 {missing}")
         else:
-            errors.append(f"Tushare: 返回空数据 (长度 {len(df) if df is not None else 0})")
+            errors.append(f"Tushare: 返回空数据")
     except Exception as e:
         errors.append(f"Tushare: {str(e)[:150]}")
 
-    # ---------- 2. 东方财富（备胎1）----------
+    # ---------- 2. 东方财富 ----------
     try:
         add_log("数据源", "尝试 东方财富 stock_zh_a_spot_em")
         df = ak.stock_zh_a_spot_em()
@@ -197,7 +168,7 @@ def fetch_realtime_data():
     except Exception as e:
         errors.append(f"东方财富: {str(e)[:50]}")
 
-    # ---------- 3. 新浪财经（备胎2）----------
+    # ---------- 3. 新浪财经 ----------
     try:
         add_log("数据源", "尝试 新浪财经 stock_sina_realtime")
         codes = st.session_state.a_code_list
@@ -227,17 +198,10 @@ def fetch_realtime_data():
     except Exception as e:
         errors.append(f"新浪财经: {str(e)[:50]}")
 
-    # ---------- 全部失败 ----------
-    error_msg = "所有数据源均失败: " + "; ".join(errors)
-    add_log("数据获取", error_msg)
-    raise Exception(error_msg)
+    raise Exception("所有数据源均失败: " + "; ".join(errors))
 
-# ===============================
-# 对外稳定获取接口（带缓存）- 非交易时间友好处理
-# ===============================
 def get_stable_realtime_data():
     now = datetime.now(tz)
-    # 优先使用今日缓存
     if st.session_state.today_real_data is not None:
         st.session_state.data_source = "cached_real_data"
         st.session_state.last_data_fetch_time = now
@@ -246,11 +210,9 @@ def get_stable_realtime_data():
 
     is_trading, msg = is_trading_day_and_time(now)
     if not is_trading:
-        # 非交易时间不强制获取，直接返回空DataFrame，UI友好提示
         add_log("数据", f"{msg}，返回空数据")
         st.session_state.data_source = "non_trading"
         st.session_state.last_data_fetch_time = now
-        # 返回一个空的DataFrame，但结构符合要求
         empty_df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
         st.session_state.today_real_data = empty_df.copy()
         return empty_df
@@ -261,6 +223,8 @@ def get_stable_realtime_data():
     st.session_state.data_source = "real_data"
     st.session_state.last_data_fetch_time = now
     return df
+
+# ...（后续因子选股、UI等代码保持不变，见上文最终优化版完整代码）...
 
 # ===============================
 # 多因子选股引擎（与你原有代码完全一致）
