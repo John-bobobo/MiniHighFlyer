@@ -27,9 +27,9 @@ st.set_page_config(page_title="尾盘博弈 6.1 · Tushare 付费版", layout="w
 # ===============================
 # 🔑 关键：你的 Tushare Token（请务必填写正确）
 # ===============================
-TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的40位token ← ← ←
-ts.set_token(TUSHARE_TOKEN)
-//pro = ts.pro_api()
+#TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的40位token ← ← ←
+#ts.set_token(TUSHARE_TOKEN)
+#pro = ts.pro_api()
 pro = ts.pro_api('7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155')
 
 # ---------- Tushare 版本检查（避免因版本过旧导致接口缺失）----------
