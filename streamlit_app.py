@@ -71,18 +71,19 @@ def add_log(event, details):
 # ===============================
 
 def create_requests_session():
-    """创建带重试策略的会话"""
+    """创建带重试策略的会话（仅为自定义请求保留，不强制注入akshare）"""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    session.timeout = (10, 30)  # 连接超时10秒，读取超时30秒
+    session.timeout = (10, 30)
     return session
 
 
+# 创建会话但不强制绑定到akshare（akshare无此方法）
 _requests_session = create_requests_session()
-ak.session(_requests_session)  # 让AKShare使用自定义会话
+# 注意：akshare 旧版本不支持 ak.session()，已删除该行
 
 
 @st.cache_data(ttl=3600)
@@ -90,7 +91,7 @@ def get_all_a_codes():
     """获取所有A股代码（用于新浪接口）"""
     try:
         df = ak.stock_zh_a_spot_em()
-        codes = df['代码'].tolist()[:2000]  # 新浪单次最多1000，此处取2000分批，简化处理
+        codes = df['代码'].tolist()[:2000]
         return codes
     except:
         return []
@@ -250,7 +251,7 @@ def get_stable_realtime_data():
 
 
 # ===============================
-# 多因子选股引擎（与您原有代码一致，仅保留核心部分）
+# 多因子选股引擎
 # ===============================
 def get_technical_indicators(df):
     """模拟技术因子（实际项目应从历史数据计算）"""
@@ -331,7 +332,7 @@ if st.session_state.today != now.date():
     st.rerun()
 
 # ===============================
-# 侧边栏 - 控制面板（移除所有示例数据相关选项）
+# 侧边栏 - 控制面板
 # ===============================
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
@@ -541,7 +542,7 @@ except Exception as e:
     st.stop()
 
 # ===============================
-# 板块分析与选股（与您原有逻辑完全一致）
+# 板块分析与选股
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
@@ -723,7 +724,7 @@ else:
         st.rerun()
 
 # ===============================
-# 推荐显示区域（与您原有代码完全一致）
+# 推荐显示区域
 # ===============================
 st.markdown("---")
 st.markdown("### 📋 推荐结果")
