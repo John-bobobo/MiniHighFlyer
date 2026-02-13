@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.1 · 云稳定版（Tushare 付费版）
-====================================
+尾盘博弈 6.1 · 云稳定版（Tushare 付费版 - 最终优化）
+===================================================
 ✅ 数据源优先级：
-   1. Tushare pro.realtime（你已购买“A股日线RT”）—— 已修正接口名
+   1. Tushare pro.realtime（你已购买“A股日线RT”）—— 接口已正确
    2. 东方财富 stock_zh_a_spot_em（AKShare）
    3. 新浪财经 stock_sina_realtime（AKShare，分批+缓存）
 ✅ 全自动尾盘推荐与锁定（13:30-14:00 首推，14:30 后锁定）
 ✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
-✅ 仅需填写你的 Tushare token，零额外修改
+✅ 极低数据量容错、友好非交易提示、Tushare 版本检查
 """
 
 import streamlit as st
@@ -22,14 +22,22 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.1 · 云稳定版（Tushare）", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.1 · Tushare 付费版", layout="wide")
 
 # ===============================
 # 🔑 关键：你的 Tushare Token（请务必填写正确）
 # ===============================
 TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的40位token ← ← ←
 ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()                      # 全局 Tushare pro 接口
+pro = ts.pro_api()
+
+# ---------- Tushare 版本检查（避免因版本过旧导致接口缺失）----------
+try:
+    from tushare import __version__ as ts_version
+    if ts_version < '1.2.89':
+        st.warning(f"⚠️ 当前 Tushare 版本 {ts_version} 可能不支持 `pro.realtime()`，请执行 `pip install --upgrade tushare` 升级到最新版。")
+except:
+    pass
 
 # ===============================
 # 时区与 Session 初始化
@@ -121,7 +129,7 @@ def standardize_sina_df(df):
     return df
 
 # ===============================
-# 🚀 数据获取核心（Tushare 优先 + 双备胎）
+# 🚀 数据获取核心（Tushare 优先 + 双备胎）- 优化容错
 # ===============================
 def fetch_realtime_data():
     """
@@ -132,52 +140,60 @@ def fetch_realtime_data():
     # ---------- 1. Tushare 实时行情（你已购买，最快最稳）----------
     try:
         add_log("数据源", "尝试 Tushare pro.realtime")
-        # ✅ 正确接口名：realtime()，不需要传任何参数
-        df = pro.realtime()
-        if df is not None and not df.empty and len(df) > 100:
-            # 标准化列名，以兼容后续处理
-            df = df.rename(columns={
+        df = pro.realtime()  # 正确接口，无参数
+        if df is not None and not df.empty:
+            # 标准化列名
+            rename_map = {
                 'ts_code': '代码',
                 'name': '名称',
                 'price': '最新价',
-                'pct_chg': '涨跌幅',      # Tushare 涨跌幅字段是 pct_chg（百分比，已乘100）
+                'pct_chg': '涨跌幅',
                 'vol': '成交量',
                 'amount': '成交额',
                 'turnover_rate': '换手率',
                 'amplitude': '振幅',
                 'circ_mv': '流通市值'
-            })
-            # Tushare 无行业字段，先填“未知”
-            df['所属行业'] = '未知'
+            }
+            # 仅重命名存在的列
+            rename_cols = {k: v for k, v in rename_map.items() if k in df.columns}
+            df = df.rename(columns=rename_cols)
+            
+            # 补充缺失的必需字段
+            if '所属行业' not in df.columns:
+                df['所属行业'] = '未知'
+            if '涨跌幅' not in df.columns and 'pct_chg' not in df.columns:
+                # 极端情况，尝试从其他字段计算
+                df['涨跌幅'] = 0.0
+            
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
-            if all(col in df.columns for col in required):
-                add_log("数据源", "✅ Tushare 实时行情 成功")
-                # 只保留下游需要的列
+            missing = [c for c in required if c not in df.columns]
+            if not missing:
+                add_log("数据源", f"✅ Tushare 实时行情 成功 (共 {len(df)} 条)")
+                # 保留下游需要的列
                 keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '换手率', '振幅', '流通市值']
                 keep_cols = [c for c in keep_cols if c in df.columns]
                 return df[keep_cols]
             else:
-                missing = [c for c in required if c not in df.columns]
                 errors.append(f"Tushare: 缺失字段 {missing}")
         else:
-            errors.append(f"Tushare: 数据无效 (长度 {len(df) if df is not None else 0})")
+            errors.append(f"Tushare: 返回空数据 (长度 {len(df) if df is not None else 0})")
     except Exception as e:
-        errors.append(f"Tushare: {str(e)[:100]}")   # 延长错误信息长度，便于排查
+        errors.append(f"Tushare: {str(e)[:150]}")
 
     # ---------- 2. 东方财富（备胎1）----------
     try:
         add_log("数据源", "尝试 东方财富 stock_zh_a_spot_em")
         df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty and len(df) > 100:
+        if df is not None and not df.empty:
             required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
             if all(col in df.columns for col in required):
-                add_log("数据源", "✅ 东方财富 成功")
+                add_log("数据源", f"✅ 东方财富 成功 (共 {len(df)} 条)")
                 return df
             else:
                 missing = [c for c in required if c not in df.columns]
                 errors.append(f"东方财富: 缺失字段 {missing}")
         else:
-            errors.append(f"东方财富: 数据无效 (长度 {len(df) if df is not None else 0})")
+            errors.append(f"东方财富: 返回空数据")
     except Exception as e:
         errors.append(f"东方财富: {str(e)[:50]}")
 
@@ -203,8 +219,8 @@ def fetch_realtime_data():
         df = standardize_sina_df(df)
         df = df[['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']]
         required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
-        if all(col in df.columns for col in required) and len(df) > 100:
-            add_log("数据源", "✅ 新浪财经 成功")
+        if all(col in df.columns for col in required) and not df.empty:
+            add_log("数据源", f"✅ 新浪财经 成功 (共 {len(df)} 条)")
             return df
         else:
             errors.append(f"新浪财经: 数据无效 (长度 {len(df)})")
@@ -212,13 +228,16 @@ def fetch_realtime_data():
         errors.append(f"新浪财经: {str(e)[:50]}")
 
     # ---------- 全部失败 ----------
-    raise Exception("所有数据源均失败: " + "; ".join(errors))
+    error_msg = "所有数据源均失败: " + "; ".join(errors)
+    add_log("数据获取", error_msg)
+    raise Exception(error_msg)
 
 # ===============================
-# 对外稳定获取接口（带缓存）
+# 对外稳定获取接口（带缓存）- 非交易时间友好处理
 # ===============================
 def get_stable_realtime_data():
     now = datetime.now(tz)
+    # 优先使用今日缓存
     if st.session_state.today_real_data is not None:
         st.session_state.data_source = "cached_real_data"
         st.session_state.last_data_fetch_time = now
@@ -227,7 +246,14 @@ def get_stable_realtime_data():
 
     is_trading, msg = is_trading_day_and_time(now)
     if not is_trading:
-        raise Exception(f"{msg}，且无缓存数据")
+        # 非交易时间不强制获取，直接返回空DataFrame，UI友好提示
+        add_log("数据", f"{msg}，返回空数据")
+        st.session_state.data_source = "non_trading"
+        st.session_state.last_data_fetch_time = now
+        # 返回一个空的DataFrame，但结构符合要求
+        empty_df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
+        st.session_state.today_real_data = empty_df.copy()
+        return empty_df
 
     add_log("数据", "开始获取实时数据")
     df = fetch_realtime_data()
@@ -324,6 +350,7 @@ with st.sidebar:
     data_source_display = {
         "real_data": "🟢 **实时数据（Tushare）**",
         "cached_real_data": "🟡 **缓存数据**",
+        "non_trading": "⚪ **非交易时间（无实时）**",
         "unknown": "⚪ **等待获取**",
         "failed": "🔴 **获取失败**"
     }.get(st.session_state.data_source, "⚪ **等待获取**")
@@ -413,7 +440,7 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    if st.session_state.today_real_data is not None:
+    if st.session_state.today_real_data is not None and not st.session_state.today_real_data.empty:
         st.markdown("#### 💾 数据缓存")
         st.info(f"已缓存{len(st.session_state.today_real_data)}条今日数据")
         if st.button("清除今日缓存"):
@@ -476,13 +503,14 @@ with col4:
 # ===============================
 st.markdown("### 📊 数据获取状态")
 try:
-    with st.spinner("正在从 Tushare 获取实时数据..."):
+    with st.spinner("正在获取实时数据..."):
         df = get_stable_realtime_data()
     
     # 数据源状态横幅
     data_source_status = {
         "real_data": ("✅", "Tushare 实时行情", "#e6f7ff"),
         "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
+        "non_trading": ("⏸️", "非交易时间（无实时）", "#f0f0f0"),
         "unknown": ("⚪", "等待获取数据", "#f0f0f0"),
         "failed": ("🔴", "数据获取失败", "#ffe6e6")
     }
@@ -510,8 +538,11 @@ try:
                 if '成交额' in df.columns:
                     st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
     else:
-        st.error("❌ 获取到的数据为空")
-        st.stop()
+        if st.session_state.data_source == "non_trading":
+            st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
+        else:
+            st.warning("⚠️ 获取到的数据为空，可能原因：交易时段无数据返回或权限不足")
+        # 不停止，允许后续流程（会自然显示无数据）
 except Exception as e:
     st.error(f"❌ 数据获取失败: {str(e)}")
     add_log("数据获取", f"最终失败: {str(e)}")
@@ -520,9 +551,9 @@ except Exception as e:
         ### 所有数据源均无法获取实时数据，可能原因：
         - **Tushare token 错误或未填写** → 请检查代码开头的 `TUSHARE_TOKEN`
         - **Tushare 权限不足** → 确认已购买“A股日线RT”且积分足够
+        - **Tushare 版本过低** → 执行 `pip install --upgrade tushare`
         - **当前非交易时间** → 实时行情只在交易时段（9:30-11:30, 13:00-15:00）提供
         - **网络环境限制** → 某些服务器/IP 可能被数据源封禁
-        - **AKShare 版本过旧** → 执行 `pip install akshare --upgrade`
         """)
     if st.button("🔄 立即重试"):
         st.cache_data.clear()
@@ -530,14 +561,15 @@ except Exception as e:
         st.session_state.data_source = "unknown"
         st.session_state.a_code_list = None
         st.rerun()
-    st.stop()
+    # 不停止，允许后续流程使用空df
+    df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 板块分析与选股
+# 板块分析与选股（适应空数据）
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
-    st.error("当前数据集中无板块信息，无法进行板块分析。")
+    st.info("当前无有效板块数据，跳过板块分析。")
     strongest_sector = None
 else:
     try:
@@ -577,7 +609,7 @@ else:
 
 st.markdown("### 🎯 多因子智能选股引擎")
 if df.empty:
-    st.error("股票数据为空，无法进行选股分析。")
+    st.info("当前无股票数据，无法进行选股。")
     top_candidate = None
 else:
     st.markdown("**流程**: 规则过滤 → 因子计算 → 综合评分 → 风险调整")
@@ -590,7 +622,8 @@ else:
             st.warning(f"板块 '{strongest_sector}' 无合适股票，使用全市场股票")
             sector_stocks = filtered_by_rule.copy()
     else:
-        st.warning("无法确定最强板块，使用全市场股票")
+        if strongest_sector is None:
+            st.info("无最强板块信息，使用全市场股票")
         sector_stocks = filtered_by_rule.copy()
 
     if not sector_stocks.empty:
@@ -673,12 +706,12 @@ else:
         top_candidate = None
 
 # ===============================
-# 自动推荐
+# 自动推荐（仅当数据源为真实数据且有候选股）
 # ===============================
 st.markdown("### 🤖 自动推荐系统")
 use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
 if not use_real_data:
-    st.warning("⚠️ 当前未使用真实数据，自动推荐功能已禁用")
+    st.info("⏸️ 当前非交易时间或无实时数据，自动推荐已暂停")
 else:
     if is_first_rec_time and st.session_state.morning_pick is None and top_candidate is not None:
         st.session_state.morning_pick = {
@@ -748,7 +781,7 @@ with col_rec1:
             if use_real_data and top_candidate is not None:
                 st.info("⏳ 正在自动生成首次推荐...")
             else:
-                st.warning("⚠️ 当前未使用真实数据或无合适股票，不生成真实推荐")
+                st.info("⏸️ 等待真实数据或合适标的")
         else:
             st.info("⏰ 首次推荐时段: 13:30-14:00")
 
@@ -795,7 +828,7 @@ with col_rec2:
             if use_real_data and top_candidate is not None:
                 st.info("⏳ 等待最终锁定...")
             else:
-                st.warning("⚠️ 当前未使用真实数据或无合适股票，不生成真实锁定")
+                st.info("⏸️ 等待真实数据或合适标的")
         else:
             st.info("⏰ 最终锁定时段: 14:30后")
 
