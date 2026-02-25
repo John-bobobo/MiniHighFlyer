@@ -577,7 +577,7 @@ else:
 # ===============================
 # 自动最终推荐（14:30后锁定前5）
 # ===============================
-is_final_lock_time = (current_hour, current_minute) >= (14, 30)
+is_final_lock_time = (current_hour, current_minute) >= (14, 45)
 
 if not df.empty and is_final_lock_time and not st.session_state.locked and current_top5 is not None:
     # 锁定当前前5作为最终推荐
