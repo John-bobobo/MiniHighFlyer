@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.1 · 云稳定版（Tushare 付费版 - 最终优化）
+尾盘博弈 6.3 · Tushare 专用版（使用 rt_k 接口）
 ===================================================
-✅ 数据源优先级：
-   1. Tushare pro.realtime（你已购买“A股日线RT”）—— 接口已正确
-   2. 东方财富 stock_zh_a_spot_em（AKShare）
-   3. 新浪财经 stock_sina_realtime（AKShare，分批+缓存）
+✅ 数据源：仅 Tushare rt_k 接口（支持全市场实时日K行情）
+✅ 按板块通配符分批获取，覆盖沪深北所有股票
+✅ 实时计算涨跌幅，标准化输出
+✅ Token 从 st.secrets 读取，安全可靠
 ✅ 全自动尾盘推荐与锁定（13:30-14:00 首推，14:30 后锁定）
 ✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
-✅ 极低数据量容错、友好非交易提示、Tushare 版本检查
 """
 
 import streamlit as st
@@ -22,21 +21,27 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.1 · Tushare 付费版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · Tushare 专用版", layout="wide")
 
 # ===============================
-# 🔑 关键：你的 Tushare Token（请务必填写正确）
+# 🔑 从 Streamlit Secrets 读取 Tushare Token
 # ===============================
-#TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"          # ← ← ← 在这里填入你的40位token ← ← ←
-#ts.set_token(TUSHARE_TOKEN)
-#pro = ts.pro_api()
-pro = ts.pro_api('7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155')
+# 请在 .streamlit/secrets.toml 中设置：
+# tushare_token = "你的40位token"
+try:
+    TUSHARE_TOKEN = st.secrets["tushare_token"]
+except KeyError:
+    st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
+    st.stop()
 
-# ---------- Tushare 版本检查（避免因版本过旧导致接口缺失）----------
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+
+# ---------- Tushare 版本检查 ----------
 try:
     from tushare import __version__ as ts_version
     if ts_version < '1.2.89':
-        st.warning(f"⚠️ 当前 Tushare 版本 {ts_version} 可能不支持 `pro.realtime()`，请执行 `pip install --upgrade tushare` 升级到最新版。")
+        st.warning("⚠️ 当前 Tushare 版本较旧，建议升级：`pip install --upgrade tushare`")
 except:
     pass
 
@@ -45,32 +50,28 @@ except:
 # ===============================
 tz = pytz.timezone("Asia/Shanghai")
 
-if "candidate_pick_history" not in st.session_state:
-    st.session_state.candidate_pick_history = []
-if "morning_pick" not in st.session_state:
-    st.session_state.morning_pick = None
-if "final_pick" not in st.session_state:
-    st.session_state.final_pick = None
-if "locked" not in st.session_state:
-    st.session_state.locked = False
-if "today" not in st.session_state:
-    st.session_state.today = datetime.now(tz).date()
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-if "backtest_results" not in st.session_state:
-    st.session_state.backtest_results = None
-if "today_real_data" not in st.session_state:
-    st.session_state.today_real_data = None
-if "data_source" not in st.session_state:
-    st.session_state.data_source = "unknown"
-if "last_data_fetch_time" not in st.session_state:
-    st.session_state.last_data_fetch_time = None
-if "data_fetch_attempts" not in st.session_state:
-    st.session_state.data_fetch_attempts = 0
-if "a_code_list" not in st.session_state:
-    st.session_state.a_code_list = None
+# 初始化 session_state 变量
+default_session_vars = {
+    "candidate_pick_history": [],
+    "morning_pick": None,
+    "final_pick": None,
+    "locked": False,
+    "today": datetime.now(tz).date(),
+    "logs": [],
+    "backtest_results": None,
+    "today_real_data": None,
+    "data_source": "unknown",
+    "last_data_fetch_time": None,
+    "data_fetch_attempts": 0,
+    "a_code_list": None,
+}
+
+for key, default in default_session_vars.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 def add_log(event, details):
+    """添加日志条目"""
     log_entry = {
         'timestamp': datetime.now(tz).strftime("%H:%M:%S"),
         'event': event,
@@ -81,6 +82,7 @@ def add_log(event, details):
         st.session_state.logs = st.session_state.logs[-30:]
 
 def is_trading_day_and_time(now=None):
+    """判断是否为交易日且交易时间"""
     if now is None:
         now = datetime.now(tz)
     weekday = now.weekday()
@@ -94,159 +96,145 @@ def is_trading_day_and_time(now=None):
         return True, "交易时间"
     return False, "非交易时间"
 
-@st.cache_data(ttl=3600)
-def get_all_a_codes_stable():
+# ===============================
+# Tushare 数据获取（仅此一家）
+# ===============================
+def fetch_from_tushare():
+    """从 Tushare rt_k 接口获取实时行情（按板块分批）"""
     try:
-        df = ak.stock_info_a_code_name()
-        codes = df['code'].tolist()
-        add_log("代码获取", f"成功获取 {len(codes)} 个A股代码")
-        return codes
-    except Exception as e:
-        add_log("代码获取", f"失败: {str(e)}")
-        return []
+        add_log("数据源", "尝试 Tushare rt_k 接口")
 
-def standardize_sina_df(df):
-    df = df.rename(columns={
-        'symbol': '代码',
-        'name': '名称',
-        'price': '最新价',
-        'changepercent': '涨跌幅',
-        'volume': '成交量',
-        'turnover': '成交额'
-    })
-    df['所属行业'] = '未知'
-    return df
+        # 定义板块通配符（覆盖沪深北所有股票）
+        # 注意：后缀必须为 .SH / .SZ / .BJ
+        board_patterns = [
+            "6*.SH",    # 上证主板
+            "0*.SZ",    # 深证主板
+            "3*.SZ",    # 创业板
+            "688*.SH",  # 科创板
+            "8*.BJ",    # 北交所（部分代码以8开头）
+            "4*.BJ",    # 北交所（部分代码以4开头，如430xxx）
+        ]
 
-def fetch_realtime_data():
-    errors = []
-    # ---------- 1. Tushare 实时行情 ----------
-    try:
-        add_log("数据源", "尝试 Tushare pro.realtime")
-        df = pro.realtime()  # ✅ 唯一正确接口
-        if df is not None and not df.empty:
-            rename_map = {
-                'ts_code': '代码',
-                'name': '名称',
-                'price': '最新价',
-                'pct_chg': '涨跌幅',
-                'vol': '成交量',
-                'amount': '成交额',
-                'turnover_rate': '换手率',
-                'amplitude': '振幅',
-                'circ_mv': '流通市值'
-            }
-            rename_cols = {k: v for k, v in rename_map.items() if k in df.columns}
-            df = df.rename(columns=rename_cols)
-            df['所属行业'] = '未知'
-            required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
-            missing = [c for c in required if c not in df.columns]
-            if not missing:
-                add_log("数据源", f"✅ Tushare 实时行情 成功 (共 {len(df)} 条)")
-                keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '换手率', '振幅', '流通市值']
-                keep_cols = [c for c in keep_cols if c in df.columns]
-                return df[keep_cols]
-            else:
-                errors.append(f"Tushare: 缺失字段 {missing}")
-        else:
-            errors.append(f"Tushare: 返回空数据")
-    except Exception as e:
-        errors.append(f"Tushare: {str(e)[:150]}")
+        all_dfs = []
+        total_stocks = 0
 
-    # ---------- 2. 东方财富 ----------
-    try:
-        add_log("数据源", "尝试 东方财富 stock_zh_a_spot_em")
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty:
-            required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
-            if all(col in df.columns for col in required):
-                add_log("数据源", f"✅ 东方财富 成功 (共 {len(df)} 条)")
-                return df
-            else:
-                missing = [c for c in required if c not in df.columns]
-                errors.append(f"东方财富: 缺失字段 {missing}")
-        else:
-            errors.append(f"东方财富: 返回空数据")
-    except Exception as e:
-        errors.append(f"东方财富: {str(e)[:50]}")
+        for pattern in board_patterns:
+            try:
+                # 单次请求，使用通配符
+                df_part = pro.rt_k(ts_code=pattern)
+                if df_part is not None and not df_part.empty:
+                    all_dfs.append(df_part)
+                    add_log("数据源", f"板块 {pattern} 获取到 {len(df_part)} 条")
+                else:
+                    add_log("数据源", f"板块 {pattern} 返回空数据")
+            except Exception as e:
+                add_log("数据源", f"板块 {pattern} 异常: {str(e)[:50]}")
+                continue
 
-    # ---------- 3. 新浪财经 ----------
-    try:
-        add_log("数据源", "尝试 新浪财经 stock_sina_realtime")
-        codes = st.session_state.a_code_list
-        if codes is None:
-            codes = get_all_a_codes_stable()
-            st.session_state.a_code_list = codes
-        if not codes:
-            errors.append("新浪财经: 无法获取股票代码列表")
-            raise Exception("无代码列表")
+        if not all_dfs:
+            add_log("数据源", "所有板块均失败，无数据")
+            return None
 
-        batch_size = 800
-        df_list = []
-        for i in range(0, len(codes), batch_size):
-            batch = codes[i:i + batch_size]
-            part = ak.stock_sina_realtime(code=batch)
-            df_list.append(part)
-            time.sleep(0.3)
-        df = pd.concat(df_list, ignore_index=True)
-        df = standardize_sina_df(df)
-        df = df[['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']]
+        df = pd.concat(all_dfs, ignore_index=True)
+
+        # 去除重复股票（同一个股票可能出现在多个板块？理论上不会，但去重保险）
+        df = df.drop_duplicates(subset=['ts_code'])
+
+        add_log("数据源", f"合并后共 {len(df)} 条股票数据")
+
+        # 计算涨跌幅
+        # rt_k 接口返回字段：ts_code, name, pre_close, high, open, low, close, vol, amount, num, ...
+        # 涨跌幅 = (close - pre_close) / pre_close * 100
+        df['涨跌幅'] = (df['close'] - df['pre_close']) / df['pre_close'] * 100
+
+        # 重命名字段为标准列名
+        rename_map = {
+            'ts_code': '代码',
+            'name': '名称',
+            'amount': '成交额',
+            'vol': '成交量',
+            'close': '最新价',
+        }
+        rename_cols = {k: v for k, v in rename_map.items() if k in df.columns}
+        df = df.rename(columns=rename_cols)
+
+        # 添加必须字段
+        df['所属行业'] = '未知'  # 如需行业信息可另行调用 stock_industry 接口
+
+        # 确保必要列存在
         required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
-        if all(col in df.columns for col in required) and not df.empty:
-            add_log("数据源", f"✅ 新浪财经 成功 (共 {len(df)} 条)")
-            return df
-        else:
-            errors.append(f"新浪财经: 数据无效 (长度 {len(df)})")
-    except Exception as e:
-        errors.append(f"新浪财经: {str(e)[:50]}")
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            add_log("数据源", f"字段缺失: {missing}")
+            return None
 
-    raise Exception("所有数据源均失败: " + "; ".join(errors))
+        # 保留有用列
+        keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']
+        keep_cols = [c for c in keep_cols if c in df.columns]
+        df = df[keep_cols]
+
+        add_log("数据源", f"✅ Tushare rt_k 成功，最终 {len(df)} 条")
+        return df
+
+    except Exception as e:
+        add_log("数据源", f"Tushare rt_k 整体异常: {str(e)[:100]}")
+        return None
 
 def get_stable_realtime_data():
+    """主数据获取函数：仅使用 Tushare，并缓存结果"""
     now = datetime.now(tz)
+
+    # 如果有今日缓存，直接返回
     if st.session_state.today_real_data is not None:
         st.session_state.data_source = "cached_real_data"
         st.session_state.last_data_fetch_time = now
         add_log("数据", "使用今日缓存")
         return st.session_state.today_real_data
 
+    # 非交易时间直接返回空 DataFrame（不缓存）
     is_trading, msg = is_trading_day_and_time(now)
     if not is_trading:
         add_log("数据", f"{msg}，返回空数据")
         st.session_state.data_source = "non_trading"
         st.session_state.last_data_fetch_time = now
-        empty_df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
-        st.session_state.today_real_data = empty_df.copy()
-        return empty_df
+        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
-    add_log("数据", "开始获取实时数据")
-    df = fetch_realtime_data()
-    st.session_state.today_real_data = df.copy()
-    st.session_state.data_source = "real_data"
-    st.session_state.last_data_fetch_time = now
-    return df
-
-# ...（后续因子选股、UI等代码保持不变，见上文最终优化版完整代码）...
+    # 只尝试 Tushare
+    df = fetch_from_tushare()
+    if df is not None and not df.empty:
+        st.session_state.today_real_data = df.copy()
+        st.session_state.data_source = "real_data"
+        st.session_state.last_data_fetch_time = now
+        add_log("数据源", "最终使用 Tushare")
+        return df
+    else:
+        # Tushare 失败
+        add_log("数据源", "Tushare 失败，返回空DataFrame")
+        st.session_state.data_source = "failed"
+        st.session_state.last_data_fetch_time = now
+        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 多因子选股引擎（与你原有代码完全一致）
+# 多因子选股引擎（保持不变）
 # ===============================
 def get_technical_indicators(df):
     """模拟技术因子（实际项目应从历史数据计算）"""
     if df.empty:
         return df
     df_factor = df.copy()
-    for stock_idx in range(len(df)):
-        base_val = df.iloc[stock_idx]['涨跌幅'] if '涨跌幅' in df.columns else 0
-        df_factor.at[stock_idx, '5日动量'] = base_val + np.random.uniform(-3, 5)
-        df_factor.at[stock_idx, '10日动量'] = base_val + np.random.uniform(-5, 8)
-        df_factor.at[stock_idx, '20日反转'] = -base_val * 0.3 + np.random.uniform(-2, 2)
-        df_factor.at[stock_idx, '波动率'] = abs(base_val) * 0.5 + np.random.uniform(1, 3)
-        if '成交量' in df.columns and stock_idx > 0:
-            avg_volume = df['成交量'].iloc[max(0, stock_idx-5):stock_idx+1].mean()
-            current_volume = df.iloc[stock_idx]['成交量']
-            df_factor.at[stock_idx, '量比'] = current_volume / avg_volume if avg_volume > 0 else 1.0
+    for idx in range(len(df)):
+        base_val = df.iloc[idx]['涨跌幅'] if '涨跌幅' in df.columns else 0
+        df_factor.loc[idx, '5日动量'] = base_val + np.random.uniform(-3, 5)
+        df_factor.loc[idx, '10日动量'] = base_val + np.random.uniform(-5, 8)
+        df_factor.loc[idx, '20日反转'] = -base_val * 0.3 + np.random.uniform(-2, 2)
+        df_factor.loc[idx, '波动率'] = abs(base_val) * 0.5 + np.random.uniform(1, 3)
+        if '成交量' in df.columns and idx > 0:
+            start = max(0, idx-5)
+            avg_volume = df['成交量'].iloc[start:idx+1].mean()
+            current_volume = df.iloc[idx]['成交量']
+            df_factor.loc[idx, '量比'] = current_volume / avg_volume if avg_volume > 0 else 1.0
         else:
-            df_factor.at[stock_idx, '量比'] = 1.0 + np.random.uniform(-0.5, 1.0)
+            df_factor.loc[idx, '量比'] = 1.0 + np.random.uniform(-0.5, 1.0)
     return df_factor
 
 def filter_stocks_by_rule(df):
@@ -257,8 +245,7 @@ def filter_stocks_by_rule(df):
     if '名称' in filtered.columns:
         filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
     if '涨跌幅' in filtered.columns:
-        filtered = filtered[filtered['涨跌幅'] < 9.5]
-        filtered = filtered[filtered['涨跌幅'] > -9.5]
+        filtered = filtered[(filtered['涨跌幅'] < 9.5) & (filtered['涨跌幅'] > -9.5)]
     if not filtered.empty and '成交额' in filtered.columns:
         threshold = max(filtered['成交额'].quantile(0.1), 2e7)
         filtered = filtered[filtered['成交额'] > threshold]
@@ -291,7 +278,7 @@ def calculate_composite_score(df, sector_avg_change, weights):
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.1 · 云稳定版（Tushare 付费版）")
+st.title("🔥 尾盘博弈 6.3 · Tushare 专用版（rt_k 接口）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -313,7 +300,7 @@ with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
     data_source_display = {
-        "real_data": "🟢 **实时数据（Tushare）**",
+        "real_data": "🟢 **实时数据（Tushare rt_k）**",
         "cached_real_data": "🟡 **缓存数据**",
         "non_trading": "⚪ **非交易时间（无实时）**",
         "unknown": "⚪ **等待获取**",
@@ -407,7 +394,7 @@ with st.sidebar:
     st.markdown("---")
     if st.session_state.today_real_data is not None and not st.session_state.today_real_data.empty:
         st.markdown("#### 💾 数据缓存")
-        st.info(f"已缓存{len(st.session_state.today_real_data)}条今日数据")
+        st.info(f"已缓存 {len(st.session_state.today_real_data)} 条今日数据")
         if st.button("清除今日缓存"):
             st.session_state.today_real_data = None
             st.session_state.data_source = "unknown"
@@ -464,16 +451,16 @@ with col4:
         st.metric("自动刷新", "30秒")
 
 # ===============================
-# 🚀 获取市场数据（核心调用）- 永不降级
+# 🚀 获取市场数据（核心调用）
 # ===============================
 st.markdown("### 📊 数据获取状态")
 try:
     with st.spinner("正在获取实时数据..."):
         df = get_stable_realtime_data()
-    
+
     # 数据源状态横幅
     data_source_status = {
-        "real_data": ("✅", "Tushare 实时行情", "#e6f7ff"),
+        "real_data": ("✅", "Tushare rt_k 实时行情", "#e6f7ff"),
         "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
         "non_trading": ("⏸️", "非交易时间（无实时）", "#f0f0f0"),
         "unknown": ("⚪", "等待获取数据", "#f0f0f0"),
@@ -506,19 +493,18 @@ try:
         if st.session_state.data_source == "non_trading":
             st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
         else:
-            st.warning("⚠️ 获取到的数据为空，可能原因：交易时段无数据返回或权限不足")
-        # 不停止，允许后续流程（会自然显示无数据）
+            st.warning("⚠️ 获取到的数据为空，可能原因：Tushare 权限不足、token错误或接口异常")
 except Exception as e:
     st.error(f"❌ 数据获取失败: {str(e)}")
     add_log("数据获取", f"最终失败: {str(e)}")
     with st.expander("🔧 故障排除指南"):
         st.markdown("""
-        ### 所有数据源均无法获取实时数据，可能原因：
-        - **Tushare token 错误或未填写** → 请检查代码开头的 `TUSHARE_TOKEN`
-        - **Tushare 权限不足** → 确认已购买“A股日线RT”且积分足够
+        ### Tushare 数据获取失败，可能原因：
+        - **Tushare token 错误或未填写** → 请检查 Secrets 中的 `tushare_token`
+        - **Tushare 权限不足** → 确认已开通“实时日K行情”权限
         - **Tushare 版本过低** → 执行 `pip install --upgrade tushare`
         - **当前非交易时间** → 实时行情只在交易时段（9:30-11:30, 13:00-15:00）提供
-        - **网络环境限制** → 某些服务器/IP 可能被数据源封禁
+        - **网络环境限制** → 某些服务器/IP 可能被 Tushare 封禁
         """)
     if st.button("🔄 立即重试"):
         st.cache_data.clear()
