@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.6 · 漏斗收敛版（板块分散，14:45 锁定）
-===================================================
+尾盘博弈 6.6.1 · 漏斗收敛版（修复 UnboundLocalError）
+=======================================================
 ✅ 真实技术指标（动量、反转、波动率、量比）
 ✅ 可配置涨幅上限，避免追高
 ✅ 因子权重自动归一化
@@ -23,7 +23,7 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.6 · 漏斗收敛版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.6.1 · 漏斗收敛版", layout="wide")
 
 # ===============================
 # 🔑 从 Streamlit Secrets 读取 Tushare Token
@@ -45,9 +45,9 @@ tz = pytz.timezone("Asia/Shanghai")
 # 初始化 session_state 变量
 default_session_vars = {
     "candidate_pick_history": [],
-    "morning_pick": None,               # 首次推荐（单个，可选）
-    "final_pick_list": None,             # 最终推荐列表（5支股票）
-    "locked": False,                     # 是否已锁定最终推荐
+    "morning_pick": None,
+    "final_pick_list": None,
+    "locked": False,
     "today": datetime.now(tz).date(),
     "logs": [],
     "backtest_results": None,
@@ -232,7 +232,7 @@ def get_history_data(ts_code, end_date=None):
         return None
 
 def calculate_factors(rt_row, history_df):
-    """根据实时数据和历史日线计算技术因子"""
+    """根据实时数据和历史日线计算技术因子（修复版）"""
     if history_df is None or len(history_df) < 5:
         return {
             '5日动量': 0.0,
@@ -244,6 +244,9 @@ def calculate_factors(rt_row, history_df):
 
     closes = history_df['close'].values
     volumes = history_df['vol'].values
+
+    # 获取当前成交量（用于量比和换手率）
+    current_volume = rt_row.get('成交量', 0)
 
     # 5日动量
     if len(closes) >= 6:
@@ -270,7 +273,6 @@ def calculate_factors(rt_row, history_df):
     # 量比
     if len(volumes) >= 6:
         avg_volume_5 = np.mean(volumes[-6:-1])
-        current_volume = rt_row.get('成交量', 0)
         volume_ratio = current_volume / avg_volume_5 if avg_volume_5 > 0 else 1.0
     else:
         volume_ratio = 1.0
@@ -370,7 +372,6 @@ def select_diverse_top5(scored_df, max_per_sector=2):
         return []
     selected = []
     sector_count = {}
-    # 遍历按评分排序后的所有股票
     for idx, row in scored_df.iterrows():
         sector = row.get('所属行业', '未知')
         current_count = sector_count.get(sector, 0)
@@ -379,15 +380,13 @@ def select_diverse_top5(scored_df, max_per_sector=2):
             sector_count[sector] = current_count + 1
         if len(selected) >= 5:
             break
-    # 如果不足5支，则放宽限制（补充剩余的高分股票，但此时已经遍历完？）
-    # 理论上 scored_df 至少包含很多股票，这里不再处理极端情况
     return selected
 
 # ===============================
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.6 · 漏斗收敛版（板块分散，14:45锁定）")
+st.title("🔥 尾盘博弈 6.6.1 · 漏斗收敛版（修复版）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
