@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.5 · Tushare 优化版（最终推荐前5锁定）
+尾盘博弈 6.6 · 漏斗收敛版（板块分散，14:45 锁定）
 ===================================================
 ✅ 真实技术指标（动量、反转、波动率、量比）
 ✅ 可配置涨幅上限，避免追高
@@ -8,8 +8,9 @@
 ✅ 增强风险调整（换手率、市值）
 ✅ 板块分析基于真实行业
 ✅ 缓存机制减少请求次数
-✅ 14:30 后自动锁定评分最高的5支股票
-✅ 实时显示动态前5，最终推荐稳定不变
+✅ 14:45 前动态轮动显示前5
+✅ 14:45 自动锁定最终推荐（板块分散，最多2支/板块）
+✅ 最终推荐包含1支主推 + 4支备选
 """
 
 import streamlit as st
@@ -22,7 +23,7 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.5 · 前5锁定版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.6 · 漏斗收敛版", layout="wide")
 
 # ===============================
 # 🔑 从 Streamlit Secrets 读取 Tushare Token
@@ -360,11 +361,33 @@ def calculate_composite_score(df, weights):
     df_scored['风险调整得分'] = df_scored['综合得分'] - risk_penalty
     return df_scored.sort_values('风险调整得分', ascending=False)
 
+def select_diverse_top5(scored_df, max_per_sector=2):
+    """
+    从已评分的 DataFrame 中选出前5支股票，保证同一板块不超过 max_per_sector 支。
+    返回包含5条记录的列表（按评分从高到低）。
+    """
+    if scored_df.empty:
+        return []
+    selected = []
+    sector_count = {}
+    # 遍历按评分排序后的所有股票
+    for idx, row in scored_df.iterrows():
+        sector = row.get('所属行业', '未知')
+        current_count = sector_count.get(sector, 0)
+        if current_count < max_per_sector:
+            selected.append(row.to_dict())
+            sector_count[sector] = current_count + 1
+        if len(selected) >= 5:
+            break
+    # 如果不足5支，则放宽限制（补充剩余的高分股票，但此时已经遍历完？）
+    # 理论上 scored_df 至少包含很多股票，这里不再处理极端情况
+    return selected
+
 # ===============================
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.5 · 前5锁定版（真实因子 + 涨幅控制）")
+st.title("🔥 尾盘博弈 6.6 · 漏斗收敛版（板块分散，14:45锁定）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -418,7 +441,7 @@ with st.sidebar:
         with col1:
             test_hour = st.number_input("模拟小时", 9, 15, 14)
         with col2:
-            test_minute = st.number_input("模拟分钟", 0, 59, 30)
+            test_minute = st.number_input("模拟分钟", 0, 59, 45)
         if st.button("🕐 应用模拟时间"):
             st.session_state.simulated_time = now.replace(hour=test_hour, minute=test_minute, second=0)
             st.rerun()
@@ -426,6 +449,13 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### ⚙️ 选股参数")
     max_increase = st.slider("📈 最大允许涨幅 (%)", 1.0, 9.5, 6.5, 0.5, help="超过此涨幅的股票将被过滤")
+
+    # 锁定时间设置
+    st.markdown("**⏰ 最终锁定时分**")
+    lock_hour = st.number_input("小时", 14, 15, 14)
+    lock_minute = st.number_input("分钟", 0, 59, 45)
+    st.caption(f"最终推荐将在 {lock_hour:02d}:{lock_minute:02d} 自动锁定")
+
     st.markdown("**多因子权重**（将自动归一化）")
     w_price = st.slider("当日涨幅", 0.0, 1.0, 0.20, 0.05)
     w_volume = st.slider("成交额", 0.0, 1.0, 0.20, 0.05)
@@ -445,13 +475,17 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("#### 🎮 手动操作")
-    if st.button("📌 手动锁定当前前5为最终推荐"):
-        if "current_top5" in st.session_state and st.session_state.current_top5 is not None:
-            st.session_state.final_pick_list = st.session_state.current_top5.copy()
-            st.session_state.locked = True
-            add_log("手动操作", "手动锁定最终推荐列表")
-            st.success("已锁定当前前5为最终推荐")
-            st.rerun()
+    if st.button("📌 手动锁定当前前5为最终推荐（带板块分散）"):
+        if "full_scored_df" in st.session_state and st.session_state.full_scored_df is not None:
+            diverse_top5 = select_diverse_top5(st.session_state.full_scored_df, max_per_sector=2)
+            if len(diverse_top5) >= 5:
+                st.session_state.final_pick_list = diverse_top5
+                st.session_state.locked = True
+                add_log("手动操作", "手动锁定最终推荐列表（板块分散）")
+                st.success("已锁定当前前5为最终推荐")
+                st.rerun()
+            else:
+                st.warning("板块分散后不足5支，请调整参数或稍后再试")
         else:
             st.warning("暂无有效候选股")
 
@@ -533,10 +567,10 @@ else:
         strongest_sector = None
 
 # ===============================
-# 多因子选股（实时计算前5）
+# 多因子选股（实时计算，保存完整排序）
 # ===============================
-st.markdown("### 🎯 实时候选排名（动态更新）")
-current_top5 = None  # 用于存储当前前5
+st.markdown("### 🎯 实时候选排名（动态轮动）")
+full_scored_df = None  # 保存完整评分DataFrame供后续使用
 
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
@@ -556,52 +590,62 @@ else:
         if not sector_stocks.empty:
             df_with_factors = add_technical_indicators(sector_stocks)
             if not df_with_factors.empty:
-                scored_df = calculate_composite_score(df_with_factors, factor_weights)
-                top_candidates = scored_df.head(10)
-                current_top5 = scored_df.head(5).to_dict('records')  # 前5转为列表
-                st.session_state.current_top5 = current_top5  # 保存供手动操作使用
-
-                # 显示实时前5
+                full_scored_df = calculate_composite_score(df_with_factors, factor_weights)
+                st.session_state.full_scored_df = full_scored_df  # 保存供手动操作使用
+                # 显示实时前5（不加板块限制，反映真实轮动）
                 display_cols = ['名称', '代码', '涨跌幅', '成交额', '综合得分', '风险调整得分', '所属行业']
-                display_df = scored_df.head(5)[display_cols].copy()
-                display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
-                display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
-                display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.3f}")
-                display_df['风险调整得分'] = display_df['风险调整得分'].apply(lambda x: f"{x:.3f}")
-                st.dataframe(display_df, use_container_width=True)
+                top5_dynamic = full_scored_df.head(5)[display_cols].copy()
+                top5_dynamic['涨跌幅'] = top5_dynamic['涨跌幅'].apply(lambda x: f"{x:.2f}%")
+                top5_dynamic['成交额'] = top5_dynamic['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
+                top5_dynamic['综合得分'] = top5_dynamic['综合得分'].apply(lambda x: f"{x:.3f}")
+                top5_dynamic['风险调整得分'] = top5_dynamic['风险调整得分'].apply(lambda x: f"{x:.3f}")
+                st.dataframe(top5_dynamic, use_container_width=True)
 
-                # 显示第一名详细信息（可选）
-                top1 = scored_df.iloc[0]
+                # 显示第一名简要信息
+                top1 = full_scored_df.iloc[0]
                 st.markdown(f"**当前第一**：{top1['名称']} ({top1['代码']}) 涨幅 {top1['涨跌幅']:.2f}%")
 
 # ===============================
-# 自动最终推荐（14:30后锁定前5）
+# 自动最终推荐（在锁定时间触发，带板块分散）
 # ===============================
-is_final_lock_time = (current_hour, current_minute) >= (14, 45)
+is_final_lock_time = (current_hour, current_minute) >= (lock_hour, lock_minute)
 
-if not df.empty and is_final_lock_time and not st.session_state.locked and current_top5 is not None:
-    # 锁定当前前5作为最终推荐
-    st.session_state.final_pick_list = current_top5.copy()
-    st.session_state.locked = True
-    add_log("自动推荐", "14:30 自动锁定最终推荐前5")
-    st.success("🎯 14:30 最终推荐已自动锁定！")
-    st.rerun()
+if not df.empty and is_final_lock_time and not st.session_state.locked and full_scored_df is not None:
+    # 从完整评分中选出板块分散的前5
+    diverse_top5 = select_diverse_top5(full_scored_df, max_per_sector=2)
+    if len(diverse_top5) >= 5:
+        st.session_state.final_pick_list = diverse_top5
+        st.session_state.locked = True
+        add_log("自动推荐", f"{lock_hour:02d}:{lock_minute:02d} 自动锁定最终推荐（板块分散）")
+        st.success(f"🎯 {lock_hour:02d}:{lock_minute:02d} 最终推荐已自动锁定！")
+        st.rerun()
+    else:
+        add_log("自动推荐", "板块分散后不足5支，暂不锁定")
+        st.warning("板块分散后候选不足5支，请检查数据或放宽过滤条件")
 
 # ===============================
-# 最终推荐展示
+# 最终推荐展示（主推 + 备选）
 # ===============================
 st.markdown("---")
 st.markdown("### 📋 最终推荐（锁定后不再变动）")
 
 if st.session_state.final_pick_list is not None and len(st.session_state.final_pick_list) > 0:
     final_df = pd.DataFrame(st.session_state.final_pick_list)
-    display_cols = ['名称', '代码', '涨跌幅', '成交额', '综合得分', '风险调整得分', '所属行业']
+    # 标记主推和备选
+    final_df['角色'] = ['主推'] + [f'备选{i}' for i in range(1, 5)]
+    display_cols = ['角色', '名称', '代码', '涨跌幅', '成交额', '综合得分', '风险调整得分', '所属行业']
     final_display = final_df[display_cols].copy()
     final_display['涨跌幅'] = final_display['涨跌幅'].apply(lambda x: f"{x:.2f}%")
     final_display['成交额'] = final_display['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
     final_display['综合得分'] = final_display['综合得分'].apply(lambda x: f"{x:.3f}")
     final_display['风险调整得分'] = final_display['风险调整得分'].apply(lambda x: f"{x:.3f}")
     st.dataframe(final_display, use_container_width=True)
+
+    # 板块分布统计
+    sector_counts = final_df['所属行业'].value_counts()
+    st.markdown("#### 📊 板块分布")
+    for sector, count in sector_counts.items():
+        st.write(f"- **{sector}**: {count} 支")
 
     # 操作建议
     st.markdown("#### 📝 明日操作计划（仅供参考）")
@@ -612,6 +656,11 @@ if st.session_state.final_pick_list is not None and len(st.session_state.final_p
         st.success("温和上涨，可考虑分批建仓")
     else:
         st.warning("整体涨幅偏高，注意追高风险，控制仓位")
+
+    # 主推单独强调
+    main_pick = final_df.iloc[0]
+    st.markdown(f"**主推关注**：{main_pick['名称']} ({main_pick['代码']}) 涨幅 {main_pick['涨跌幅']:.2f}%")
+
 else:
     if is_final_lock_time:
         if df.empty:
@@ -619,7 +668,7 @@ else:
         else:
             st.info("⏳ 正在计算最终推荐，请稍候...")
     else:
-        st.info(f"⏰ 最终锁定时段: 14:30 后（当前 {current_hour:02d}:{current_minute:02d}）")
+        st.info(f"⏰ 最终锁定时段: {lock_hour:02d}:{lock_minute:02d} 后（当前 {current_hour:02d}:{current_minute:02d}）")
 
 # ===============================
 # 系统日志与自动刷新
