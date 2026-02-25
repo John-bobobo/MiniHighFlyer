@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.6.1 · 漏斗收敛版（修复 UnboundLocalError）
+尾盘博弈 6.6.3 · 漏斗收敛版（修复卡顿 + 进度提示）
 =======================================================
 ✅ 真实技术指标（动量、反转、波动率、量比）
 ✅ 可配置涨幅上限，避免追高
@@ -11,6 +11,8 @@
 ✅ 14:45 前动态轮动显示前5
 ✅ 14:45 自动锁定最终推荐（板块分散，最多2支/板块）
 ✅ 最终推荐包含1支主推 + 4支备选
+✅ 增加请求超时与重试，避免卡死
+✅ 添加进度条提示，用户可感知处理进度
 """
 
 import streamlit as st
@@ -23,7 +25,7 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.6.1 · 漏斗收敛版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.6.3 · 优化版", layout="wide")
 
 # ===============================
 # 🔑 从 Streamlit Secrets 读取 Tushare Token
@@ -36,6 +38,9 @@ except KeyError:
 
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
+
+# 设置全局超时（防止网络卡死）
+pro.set_timeout(10)  # 10秒超时
 
 # ===============================
 # 时区与 Session 初始化
@@ -90,25 +95,30 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
-# Tushare 数据获取函数（带缓存）
+# Tushare 数据获取函数（带缓存和重试）
 # ===============================
 def fetch_stock_basic():
     """获取并缓存股票基本信息（代码、名称、行业）"""
     if st.session_state.stock_basic is not None:
         return st.session_state.stock_basic
-    try:
-        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry,market')
-        if df is not None and not df.empty:
-            df = df.rename(columns={'ts_code': '代码', 'name': '名称', 'industry': '所属行业'})
-            st.session_state.stock_basic = df
-            add_log("数据源", f"获取股票基本信息 {len(df)} 条")
-            return df
-        else:
-            add_log("数据源", "股票基本信息获取失败")
-            return pd.DataFrame(columns=['代码', '名称', '所属行业'])
-    except Exception as e:
-        add_log("数据源", f"获取股票基本信息异常: {str(e)}")
-        return pd.DataFrame(columns=['代码', '名称', '所属行业'])
+
+    # 尝试获取，最多重试3次
+    for attempt in range(3):
+        try:
+            df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry,market')
+            if df is not None and not df.empty:
+                df = df.rename(columns={'ts_code': '代码', 'name': '名称', 'industry': '所属行业'})
+                st.session_state.stock_basic = df
+                add_log("数据源", f"获取股票基本信息成功，共 {len(df)} 条")
+                return df
+            else:
+                add_log("数据源", f"股票基本信息获取尝试 {attempt+1} 失败，返回空")
+        except Exception as e:
+            add_log("数据源", f"股票基本信息异常 (尝试 {attempt+1}): {str(e)}")
+        time.sleep(2)
+
+    st.warning("⚠️ 无法获取股票行业信息，板块分析将跳过")
+    return pd.DataFrame(columns=['代码', '名称', '所属行业'])
 
 def fetch_from_tushare():
     """从 Tushare rt_k 接口获取实时行情（按板块分批）"""
@@ -152,10 +162,14 @@ def fetch_from_tushare():
         # 合并行业信息
         basic = fetch_stock_basic()
         if not basic.empty:
+            original_len = len(df)
             df = df.merge(basic[['代码', '所属行业']], on='代码', how='left')
             df['所属行业'] = df['所属行业'].fillna('未知')
+            covered = (df['所属行业'] != '未知').sum()
+            add_log("数据源", f"行业覆盖: {covered}/{original_len} 支股票有行业信息")
         else:
             df['所属行业'] = '未知'
+            add_log("数据源", "无行业数据，全部标记为未知")
 
         # 保留必要字段
         keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量']
@@ -206,10 +220,10 @@ def get_stable_realtime_data():
     return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 历史数据获取与因子计算
+# 历史数据获取与因子计算（带超时与重试）
 # ===============================
 def get_history_data(ts_code, end_date=None):
-    """获取个股最近20个交易日的历史日线数据（缓存）"""
+    """获取个股最近20个交易日的历史日线数据（缓存），失败返回None"""
     cache = st.session_state.history_cache
     today_str = datetime.now(tz).strftime('%Y%m%d')
     cache_key = f"{ts_code}_{today_str}"
@@ -217,19 +231,24 @@ def get_history_data(ts_code, end_date=None):
     if cache_key in cache:
         return cache[cache_key]
 
-    try:
-        if end_date is None:
-            end_date = datetime.now(tz).strftime('%Y%m%d')
-        df = pro.daily(ts_code=ts_code, end_date=end_date, limit=20)
-        if df is not None and not df.empty:
-            df = df.sort_values('trade_date')
-            cache[cache_key] = df
-            return df
-        else:
-            return None
-    except Exception as e:
-        add_log("历史数据", f"{ts_code} 获取失败: {str(e)[:50]}")
-        return None
+    # 尝试获取，最多重试2次
+    for attempt in range(2):
+        try:
+            if end_date is None:
+                end_date = datetime.now(tz).strftime('%Y%m%d')
+            df = pro.daily(ts_code=ts_code, end_date=end_date, limit=20)
+            if df is not None and not df.empty:
+                df = df.sort_values('trade_date')
+                cache[cache_key] = df
+                return df
+            else:
+                # 无数据也返回None
+                return None
+        except Exception as e:
+            add_log("历史数据", f"{ts_code} 获取失败 (尝试 {attempt+1}): {str(e)[:50]}")
+            time.sleep(1)  # 短暂等待后重试
+
+    return None
 
 def calculate_factors(rt_row, history_df):
     """根据实时数据和历史日线计算技术因子（修复版）"""
@@ -245,7 +264,6 @@ def calculate_factors(rt_row, history_df):
     closes = history_df['close'].values
     volumes = history_df['vol'].values
 
-    # 获取当前成交量（用于量比和换手率）
     current_volume = rt_row.get('成交量', 0)
 
     # 5日动量
@@ -289,17 +307,28 @@ def calculate_factors(rt_row, history_df):
     }
 
 def add_technical_indicators(df):
-    """为DataFrame中的每只股票添加技术因子"""
+    """为DataFrame中的每只股票添加技术因子，带进度条"""
     if df.empty:
         return df
 
     df = df.copy()
     factor_list = []
+
+    # 创建进度条
+    progress_bar = st.progress(0, text="正在获取历史数据并计算因子...")
+    total = len(df)
+
     for idx, row in df.iterrows():
         code = row['代码']
         history = get_history_data(code)
         factors = calculate_factors(row, history)
         factor_list.append(factors)
+
+        # 更新进度条
+        if (idx + 1) % 10 == 0 or (idx + 1) == total:
+            progress_bar.progress((idx + 1) / total, text=f"已处理 {idx+1}/{total} 支股票")
+
+    progress_bar.empty()  # 完成后移除进度条
 
     factor_df = pd.DataFrame(factor_list)
     df = pd.concat([df, factor_df], axis=1)
@@ -386,7 +415,7 @@ def select_diverse_top5(scored_df, max_per_sector=2):
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.6.1 · 漏斗收敛版（修复版）")
+st.title("🔥 尾盘博弈 6.6.3 · 优化版（进度条 + 超时控制）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -517,6 +546,11 @@ if not df.empty:
     st.success(f"✅ 成功获取 {len(df)} 条实时数据")
     with st.expander("🔍 查看数据样本"):
         st.dataframe(df[['代码', '名称', '涨跌幅', '成交额', '所属行业']].head(10))
+    
+    # 显示行业数据统计
+    if '所属行业' in df.columns:
+        known_industry = (df['所属行业'] != '未知').sum()
+        st.caption(f"行业信息覆盖: {known_industry}/{len(df)} 支股票 ({(known_industry/len(df)*100):.1f}%)")
 else:
     if st.session_state.data_source == "non_trading":
         st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
@@ -527,40 +561,53 @@ else:
 # 板块分析
 # ===============================
 st.markdown("### 📊 板块热度分析")
-if df.empty or '所属行业' not in df.columns or df['所属行业'].nunique() <= 1:
-    st.info("当前无有效板块数据，跳过板块分析。")
+# 判断是否有足够的行业数据进行分析
+has_valid_sector = False
+if not df.empty and '所属行业' in df.columns:
+    known_sectors = df[df['所属行业'] != '未知']['所属行业'].unique()
+    if len(known_sectors) > 0:
+        has_valid_sector = True
+
+if not has_valid_sector:
+    st.info("当前行业数据不足（可能由于 Tushare 权限或网络问题），跳过板块分析。选股将基于全市场进行。")
     strongest_sector = None
 else:
     try:
-        sector_analysis = df.groupby('所属行业').agg({
-            '涨跌幅': 'mean',
-            '成交额': 'sum',
-            '代码': 'count'
-        }).rename(columns={'代码': '股票数量'}).reset_index()
-        sector_analysis['平均涨幅'] = sector_analysis['涨跌幅']
-        sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
-        sector_analysis['强度得分'] = (
-            sector_analysis['平均涨幅'].rank(pct=True) * 40 +
-            sector_analysis['资金占比'].rank(pct=True) * 40 +
-            sector_analysis['股票数量'].rank(pct=True) * 20
-        )
-        sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
-        top_sectors = sector_analysis.head(5)
+        # 只使用有行业信息的股票进行板块分析
+        df_with_sector = df[df['所属行业'] != '未知'].copy()
+        if df_with_sector.empty:
+            st.info("所有股票行业均为未知，跳过板块分析。")
+            strongest_sector = None
+        else:
+            sector_analysis = df_with_sector.groupby('所属行业').agg({
+                '涨跌幅': 'mean',
+                '成交额': 'sum',
+                '代码': 'count'
+            }).rename(columns={'代码': '股票数量'}).reset_index()
+            sector_analysis['平均涨幅'] = sector_analysis['涨跌幅']
+            sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
+            sector_analysis['强度得分'] = (
+                sector_analysis['平均涨幅'].rank(pct=True) * 40 +
+                sector_analysis['资金占比'].rank(pct=True) * 40 +
+                sector_analysis['股票数量'].rank(pct=True) * 20
+            )
+            sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
+            top_sectors = sector_analysis.head(5)
 
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            if not top_sectors.empty:
-                st.bar_chart(top_sectors.set_index('所属行业')[['平均涨幅', '资金占比']])
-        with col2:
-            st.markdown("#### 🔥 热门板块")
-            for idx, row in top_sectors.iterrows():
-                emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx % 5]
-                st.write(f"{emoji} **{row['所属行业']}**")
-                st.progress(min(row['强度得分'] / 100, 1.0))
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                if not top_sectors.empty:
+                    st.bar_chart(top_sectors.set_index('所属行业')[['平均涨幅', '资金占比']])
+            with col2:
+                st.markdown("#### 🔥 热门板块")
+                for idx, row in top_sectors.iterrows():
+                    emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx % 5]
+                    st.write(f"{emoji} **{row['所属行业']}**")
+                    st.progress(min(row['强度得分'] / 100, 1.0))
 
-        strongest_sector = top_sectors.iloc[0]['所属行业'] if not top_sectors.empty else None
-        if strongest_sector:
-            st.success(f"🏆 今日最强板块: **{strongest_sector}**")
+            strongest_sector = top_sectors.iloc[0]['所属行业'] if not top_sectors.empty else None
+            if strongest_sector:
+                st.success(f"🏆 今日最强板块: **{strongest_sector}**")
     except Exception as e:
         st.error(f"板块分析错误: {str(e)}")
         strongest_sector = None
@@ -574,11 +621,12 @@ full_scored_df = None  # 保存完整评分DataFrame供后续使用
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
 else:
-    with st.spinner("正在计算技术因子..."):
+    with st.spinner("正在准备选股数据..."):
         # 基础过滤
         filtered = filter_stocks_by_rule(df, max_increase)
         st.caption(f"基础过滤后股票数: {len(filtered)} / {len(df)}")
 
+        # 如果存在最强板块且板块数据有效，优先从该板块选股；否则全市场
         if strongest_sector and '所属行业' in filtered.columns:
             sector_stocks = filtered[filtered['所属行业'] == strongest_sector].copy()
             if sector_stocks.empty:
@@ -587,6 +635,7 @@ else:
             sector_stocks = filtered.copy()
 
         if not sector_stocks.empty:
+            # 添加技术因子（包含进度条）
             df_with_factors = add_technical_indicators(sector_stocks)
             if not df_with_factors.empty:
                 full_scored_df = calculate_composite_score(df_with_factors, factor_weights)
