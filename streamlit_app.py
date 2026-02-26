@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.5 · Tushare 专用版（趋势增强版，稳定修复）
+尾盘博弈 6.5 · Tushare 专用版（趋势增强版，终极稳定版）
 ===================================================
 ✅ 数据源：仅 Tushare rt_k 接口（支持全市场实时日K行情）
 ✅ 按板块通配符分批获取，覆盖沪深北所有股票
@@ -12,7 +12,7 @@
 ✅ 新增：14:00后漏斗记录，14:40收敛推荐并给出备选
 ✅ 优化：利用历史日线数据计算MACD、均线排列等趋势指标，替换原固定量比因子
 ✅ 修复：单只股票历史数据异常不影响整体选股，确保引擎稳定运行
-✅ 增强：选股引擎全局异常捕获，避免因意外错误导致页面空白
+✅ 增强：数据有效性校验、除零保护、确保自动刷新永不中断
 """
 
 import streamlit as st
@@ -31,8 +31,6 @@ st.set_page_config(page_title="尾盘博弈 6.5 · Tushare 专用版", layout="w
 # ===============================
 # 🔑 从 Streamlit Secrets 读取 Tushare Token
 # ===============================
-# 请在 .streamlit/secrets.toml 中设置：
-# tushare_token = "你的40位token"
 try:
     TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"
 except KeyError:
@@ -105,14 +103,13 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
-# Tushare 数据获取（仅此一家）
+# Tushare 数据获取（增强校验）
 # ===============================
 def fetch_from_tushare():
     """从 Tushare rt_k 接口获取实时行情（按板块分批）"""
     try:
         add_log("数据源", "尝试 Tushare rt_k 接口")
 
-        # 定义板块通配符（覆盖沪深北所有股票）
         board_patterns = [
             "6*.SH",    # 上证主板
             "0*.SZ",    # 深证主板
@@ -141,10 +138,13 @@ def fetch_from_tushare():
 
         df = pd.concat(all_dfs, ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code'])
+
         add_log("数据源", f"合并后共 {len(df)} 条股票数据")
 
+        # 计算涨跌幅
         df['涨跌幅'] = (df['close'] - df['pre_close']) / df['pre_close'] * 100
 
+        # 重命名字段
         rename_map = {
             'ts_code': '代码',
             'name': '名称',
@@ -159,14 +159,17 @@ def fetch_from_tushare():
         rename_cols = {k: v for k, v in rename_map.items() if k in df.columns}
         df = df.rename(columns=rename_cols)
 
+        # 行业字段暂为未知
         df['所属行业'] = '未知'
 
+        # 检查必要字段
         required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
         missing = [c for c in required if c not in df.columns]
         if missing:
             add_log("数据源", f"字段缺失: {missing}")
             return None
 
+        # 保留有用列
         keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '开盘价', '最高价', '最低价', '昨收价']
         keep_cols = [c for c in keep_cols if c in df.columns]
         df = df[keep_cols]
@@ -197,7 +200,7 @@ def get_stable_realtime_data():
 
     df = fetch_from_tushare()
     if df is not None and not df.empty:
-        # 合并行业信息
+        # ========== 合并行业信息 ==========
         if 'a_code_list' not in st.session_state or st.session_state.a_code_list is None:
             try:
                 stock_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
@@ -231,10 +234,14 @@ def get_stable_realtime_data():
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 辅助函数：获取股票历史日线数据（带缓存）
+# 辅助函数：获取股票历史日线数据（带缓存，增强容错）
 # ===============================
 def get_hist_data_cached(ts_code):
-    """从缓存或Tushare获取股票近30个交易日的历史日线数据"""
+    """
+    从缓存或Tushare获取股票近30个交易日的历史日线数据
+    返回DataFrame，包含日期和close等字段，按日期正序排列
+    """
+    # 检查缓存
     if ts_code in st.session_state.hist_data_cache:
         return st.session_state.hist_data_cache[ts_code]
 
@@ -259,25 +266,35 @@ def get_hist_data_cached(ts_code):
 # 多因子选股引擎（优化版，增加趋势因子，带异常处理）
 # ===============================
 def get_technical_indicators(df, sector_avg_dict=None):
-    """计算真实技术因子，并利用历史数据计算趋势得分，赋值给量比因子"""
+    """
+    计算真实技术因子，并利用历史数据计算趋势得分，赋值给量比因子
+    df: 包含实时行情字段的DataFrame（必须含有open, high, low, close, pre_close, 成交额, 成交量, 所属行业）
+    sector_avg_dict: 行业平均涨幅字典（可选，用于计算相对强度）
+    """
     if df.empty:
         return df
 
     df_factor = df.copy()
 
     try:
+        # 计算振幅
         df_factor['振幅'] = (df_factor['最高价'] - df_factor['最低价']) / df_factor['昨收价'] * 100
+
+        # 计算回落幅度（相对于当日高点）
         df_factor['回落幅度'] = (df_factor['最高价'] - df_factor['最新价']) / df_factor['昨收价'] * 100
+
+        # 计算是否曾涨停（用于后续过滤）
         df_factor['曾涨停'] = ((df_factor['最高价'] - df_factor['昨收价']) / df_factor['昨收价'] * 100) >= 9.5
 
+        # 计算相对强度（个股涨幅 - 行业平均涨幅）
         if sector_avg_dict is not None and '所属行业' in df_factor.columns:
             df_factor['相对强度'] = df_factor.apply(
                 lambda row: row['涨跌幅'] - sector_avg_dict.get(row['所属行业'], 0), axis=1
             )
         else:
-            df_factor['相对强度'] = df_factor['涨跌幅']
+            df_factor['相对强度'] = df_factor['涨跌幅']  # 若无行业平均，则直接用涨幅
 
-        # 趋势因子计算
+        # ========== 趋势因子计算（增加异常处理）==========
         trend_scores = []
         for idx, row in df_factor.iterrows():
             ts_code = row['代码']
@@ -285,29 +302,34 @@ def get_technical_indicators(df, sector_avg_dict=None):
                 hist_df = get_hist_data_cached(ts_code)
                 if hist_df is not None and len(hist_df) >= 20:
                     close = hist_df['close'].values
-                    # 计算MACD
-                    exp12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
-                    exp26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
-                    diff = exp12 - exp26
-                    dea = pd.Series(diff).ewm(span=9, adjust=False).mean().values
-                    macd_hist = (diff - dea) * 2
+                    # 计算MACD（使用pandas ewm）
+                    # 确保数据没有NaN
+                    close_series = pd.Series(close).dropna()
+                    if len(close_series) >= 26:
+                        exp12 = close_series.ewm(span=12, adjust=False).mean().values
+                        exp26 = close_series.ewm(span=26, adjust=False).mean().values
+                        diff = exp12 - exp26
+                        dea = pd.Series(diff).ewm(span=9, adjust=False).mean().values
+                        macd_hist = (diff - dea) * 2
 
-                    latest_diff = diff[-1]
-                    latest_dea = dea[-1]
-                    latest_macd_hist = macd_hist[-1]
-                    golden_cross = 1 if latest_diff > latest_dea else 0
+                        latest_diff = diff[-1]
+                        latest_dea = dea[-1]
+                        latest_macd_hist = macd_hist[-1]
+                        golden_cross = 1 if latest_diff > latest_dea else 0
 
-                    # 计算均线
-                    ma5 = pd.Series(close).rolling(5).mean().values
-                    ma10 = pd.Series(close).rolling(10).mean().values
-                    ma20 = pd.Series(close).rolling(20).mean().values
+                        # 计算均线
+                        ma5 = close_series.rolling(5).mean().values
+                        ma10 = close_series.rolling(10).mean().values
+                        ma20 = close_series.rolling(20).mean().values
 
-                    bull_arrangement = 1 if (ma5[-1] > ma10[-1] > ma20[-1]) else 0
-                    macd_positive = 1 if latest_macd_hist > 0 else 0
+                        bull_arrangement = 1 if (ma5[-1] > ma10[-1] > ma20[-1]) else 0
+                        macd_positive = 1 if latest_macd_hist > 0 else 0
 
-                    raw_score = golden_cross + bull_arrangement + macd_positive * 0.5
-                    max_raw = 2.5
-                    trend_score = raw_score / max_raw
+                        raw_score = golden_cross + bull_arrangement + macd_positive * 0.5
+                        max_raw = 2.5
+                        trend_score = raw_score / max_raw
+                    else:
+                        trend_score = 0.5
                 else:
                     trend_score = 0.5
             except Exception as e:
@@ -315,9 +337,11 @@ def get_technical_indicators(df, sector_avg_dict=None):
                 trend_score = 0.5
             trend_scores.append(trend_score)
 
+        # 确保trend_scores长度与df_factor一致
         if len(trend_scores) == len(df_factor):
             df_factor['趋势得分'] = trend_scores
         else:
+            # 如果长度不匹配（理论上不会），则全部设为默认值
             df_factor['趋势得分'] = 0.5
 
         # 将趋势得分赋值给“量比”因子
@@ -330,7 +354,7 @@ def get_technical_indicators(df, sector_avg_dict=None):
 
     except Exception as e:
         add_log("因子计算", f"整体异常: {str(e)[:100]}")
-        # 如果整体异常，至少保证基础因子存在
+        # 保底因子
         df_factor['量比'] = 0.5
         df_factor['5日动量'] = df_factor.get('涨跌幅', 0)
         df_factor['20日反转'] = 0
@@ -344,16 +368,26 @@ def filter_stocks_by_rule(df):
         return df
     filtered = df.copy()
     try:
+        # 剔除ST
         if '名称' in filtered.columns:
             filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
+        # 剔除涨跌幅>9.5或<-9.5
         if '涨跌幅' in filtered.columns:
             filtered = filtered[(filtered['涨跌幅'] < 9.5) & (filtered['涨跌幅'] > -9.5)]
+        # 剔除涨幅>6.5%的股票
+        if '涨跌幅' in filtered.columns:
             filtered = filtered[filtered['涨跌幅'] <= 6.5]
+        # 成交额阈值
         if not filtered.empty and '成交额' in filtered.columns:
-            threshold = max(filtered['成交额'].quantile(0.1), 2e7)
+            try:
+                threshold = max(filtered['成交额'].quantile(0.1), 2e7)
+            except:
+                threshold = 2e7
             filtered = filtered[filtered['成交额'] > threshold]
+        # 换手率过滤（如果有）
         if '换手率' in filtered.columns:
             filtered = filtered[(filtered['换手率'] > 0.5) & (filtered['换手率'] < 50)]
+        # 剔除炸板股：曾涨停且当前未封住
         if '曾涨停' in filtered.columns:
             filtered = filtered[~((filtered['曾涨停']) & (filtered['最新价'] < filtered['最高价']))]
         else:
@@ -364,7 +398,7 @@ def filter_stocks_by_rule(df):
     return filtered
 
 def calculate_composite_score(df, sector_avg_change, weights):
-    """多因子综合评分（带异常保护）"""
+    """多因子综合评分"""
     if df.empty:
         return df
     try:
@@ -372,8 +406,10 @@ def calculate_composite_score(df, sector_avg_change, weights):
         total_score = np.zeros(len(df_scored))
         for factor, weight in weights.items():
             if factor in df_scored.columns and weight != 0:
-                factor_rank = df_scored[factor].rank(pct=True, method='average')
-                total_score += factor_rank * weight
+                # 防止全为NaN导致rank报错
+                if df_scored[factor].notna().sum() > 0:
+                    factor_rank = df_scored[factor].rank(pct=True, method='average')
+                    total_score += factor_rank * weight
         df_scored['综合得分'] = total_score
         risk_penalty = np.zeros(len(df_scored))
         if '涨跌幅' in df_scored.columns:
@@ -386,13 +422,19 @@ def calculate_composite_score(df, sector_avg_change, weights):
         return df_scored.sort_values('风险调整得分', ascending=False)
     except Exception as e:
         add_log("评分计算", f"异常: {str(e)[:50]}")
-        return pd.DataFrame()  # 返回空DataFrame
+        return pd.DataFrame()
 
 def converge_candidates(history, latest_scored_df, top_n=3):
-    """从历史记录中收敛出最稳定的候选股"""
+    """
+    从历史记录中收敛出最稳定的候选股
+    history: 列表，每个元素包含time和candidates（代码及得分）
+    latest_scored_df: 当前评分DataFrame，用于获取最新信息
+    top_n: 返回前几名
+    """
     if not history or latest_scored_df.empty:
         return None
 
+    # 统计每个代码出现的次数
     code_count = {}
     code_total_score = {}
     for record in history:
@@ -402,10 +444,16 @@ def converge_candidates(history, latest_scored_df, top_n=3):
             code_count[code] = code_count.get(code, 0) + 1
             code_total_score[code] = code_total_score.get(code, 0) + score
 
+    # 计算每个代码的平均得分
     code_avg_score = {code: code_total_score[code]/code_count[code] for code in code_count}
+
+    # 综合指标：出现次数 * 平均得分
     code_composite = {code: code_count[code] * code_avg_score[code] for code in code_count}
+
+    # 按综合值排序
     sorted_codes = sorted(code_composite.items(), key=lambda x: x[1], reverse=True)
 
+    # 从latest_scored_df中获取这些股票的详细信息
     result = []
     for code, _ in sorted_codes[:top_n]:
         stock_info = latest_scored_df[latest_scored_df['代码'] == code]
@@ -439,15 +487,16 @@ if st.session_state.today != now.date():
     st.session_state.data_source = "unknown"
     st.session_state.data_fetch_attempts = 0
     st.session_state.a_code_list = None
-    st.session_state.candidate_history = []
+    st.session_state.candidate_history = []   # 清空历史记录
     st.session_state.final_candidates = None
-    st.session_state.hist_data_cache = {}
+    st.session_state.hist_data_cache = {}     # 清空历史数据缓存
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
-# 侧边栏 - 控制面板（与之前完全相同，此处省略以节省篇幅，请保留原样）
+# ===============================
+# 侧边栏 - 控制面板
+# ===============================
 with st.sidebar:
-    # ... 完整侧边栏代码请从用户提供的6.5版本复制 ...
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
     data_source_display = {
@@ -475,9 +524,9 @@ with st.sidebar:
         st.session_state.today_real_data = None
         st.session_state.data_source = "unknown"
         st.session_state.a_code_list = None
-        st.session_state.candidate_history = []
+        st.session_state.candidate_history = []   # 清空历史记录
         st.session_state.final_candidates = None
-        st.session_state.hist_data_cache = {}
+        st.session_state.hist_data_cache = {}     # 清空历史数据缓存
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
         st.rerun()
@@ -592,7 +641,7 @@ with col2:
     st.metric("当前时段", period)
 with col3:
     is_first_rec_time = (13, 30) <= (current_hour, current_minute) < (14, 0)
-    is_final_lock_time = (current_hour, current_minute) >= (14, 40)
+    is_final_lock_time = (current_hour, current_minute) >= (14, 40)   # 改为14:40
     if is_first_rec_time:
         st.metric("推荐状态", "🟢 可推荐")
     elif is_final_lock_time:
@@ -616,6 +665,7 @@ try:
     with st.spinner("正在获取实时数据..."):
         df = get_stable_realtime_data()
 
+    # 数据源状态横幅
     data_source_status = {
         "real_data": ("✅", "Tushare rt_k 实时行情", "#e6f7ff"),
         "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
@@ -669,6 +719,7 @@ except Exception as e:
         st.session_state.data_source = "unknown"
         st.session_state.a_code_list = None
         st.rerun()
+    # 不停止，允许后续流程使用空df
     df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
@@ -686,12 +737,23 @@ else:
             '代码': 'count'
         }).rename(columns={'代码': '股票数量'}).reset_index()
         sector_analysis['平均涨幅'] = sector_analysis['涨跌幅']
-        sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
-        sector_analysis['强度得分'] = (
-            sector_analysis['平均涨幅'].rank(pct=True) * 40 +
-            sector_analysis['资金占比'].rank(pct=True) * 40 +
-            sector_analysis['股票数量'].rank(pct=True) * 20
-        )
+        total_amount = sector_analysis['成交额'].sum()
+        if total_amount > 0:
+            sector_analysis['资金占比'] = sector_analysis['成交额'] / total_amount
+        else:
+            sector_analysis['资金占比'] = 0
+            add_log("板块分析", "成交额总和为0，资金占比设为0")
+
+        # 计算强度得分，防止单一行导致rank出错
+        try:
+            sector_analysis['强度得分'] = (
+                sector_analysis['平均涨幅'].rank(pct=True) * 40 +
+                sector_analysis['资金占比'].rank(pct=True) * 40 +
+                sector_analysis['股票数量'].rank(pct=True) * 20
+            )
+        except:
+            sector_analysis['强度得分'] = 0
+
         sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
         top_sectors = sector_analysis.head(5)
 
@@ -712,6 +774,7 @@ else:
             st.success(f"🏆 今日最强板块: **{strongest_sector}**")
     except Exception as e:
         st.error(f"板块分析错误: {str(e)}")
+        add_log("板块分析", f"异常: {str(e)[:50]}")
         strongest_sector = None
 
 st.markdown("### 🎯 多因子智能选股引擎")
@@ -723,7 +786,7 @@ else:
     filtered_by_rule = filter_stocks_by_rule(df)
     st.caption(f"基础过滤后股票数: {len(filtered_by_rule)} / {len(df)}")
 
-    # ===== 关键修复：选股引擎整体异常捕获 =====
+    # 全局异常捕获，确保即使出错，后续流程也能继续
     try:
         # 计算行业平均涨幅（用于相对强度）
         sector_avg_dict = None
@@ -741,16 +804,17 @@ else:
 
             if not scored_df.empty:
                 top_candidates = scored_df.head(10)
-                top_candidate = scored_df.iloc[0]
+                top_candidate = scored_df.iloc[0] if not scored_df.empty else None
 
-                # 漏斗机制：14:00后记录前5名
-                if (current_hour >= 14) and (current_hour < 15):
+                # ========== 漏斗机制：14:00后记录前5名 ==========
+                if (current_hour >= 14) and (current_hour < 15):   # 14:00 - 14:59
                     top5 = scored_df.head(5)[['代码', '风险调整得分']].to_dict('records')
                     record = {
                         'time': current_time_str,
                         'candidates': top5
                     }
                     st.session_state.candidate_history.append(record)
+                    # 保持最近30条记录
                     if len(st.session_state.candidate_history) > 30:
                         st.session_state.candidate_history = st.session_state.candidate_history[-30:]
                     add_log("漏斗记录", f"记录当前前5名")
@@ -855,10 +919,12 @@ else:
     # 最终锁定：14:40后，使用收敛结果
     if is_final_lock_time and not st.session_state.locked:
         if use_real_data and not df.empty and top_candidate is not None:
-            try:
-                if st.session_state.candidate_history and len(st.session_state.candidate_history) >= 3:
+            # 如果有历史记录，进行收敛
+            if st.session_state.candidate_history and len(st.session_state.candidate_history) >= 3:  # 至少3条记录
+                try:
                     final_candidates = converge_candidates(st.session_state.candidate_history, scored_df, top_n=3)
                     if final_candidates and len(final_candidates) > 0:
+                        # 第一名作为最终推荐
                         best = final_candidates[0]
                         st.session_state.final_pick = {
                             'name': best['name'],
@@ -875,7 +941,8 @@ else:
                             '平均得分': best['平均得分']
                         }
                         st.session_state.locked = True
-                        st.session_state.final_candidates = final_candidates[1:]
+                        # 保存备选
+                        st.session_state.final_candidates = final_candidates[1:]  # 第二、第三
                         add_log("自动推荐", f"锁定最终推荐: {best['name']}，备选: {[c['name'] for c in final_candidates[1:]]}")
                         st.rerun()
                     else:
@@ -896,7 +963,9 @@ else:
                         st.session_state.final_candidates = []
                         add_log("自动推荐", f"收敛失败，使用当前最优: {top_candidate.get('名称', '')}")
                         st.rerun()
-                else:
+                except Exception as e:
+                    add_log("自动推荐", f"收敛异常: {str(e)[:50]}")
+                    # 回退
                     st.session_state.final_pick = {
                         'name': top_candidate.get('名称', ''),
                         'code': top_candidate.get('代码', ''),
@@ -911,12 +980,26 @@ else:
                     }
                     st.session_state.locked = True
                     st.session_state.final_candidates = []
-                    add_log("自动推荐", f"历史记录不足，使用当前最优: {top_candidate.get('名称', '')}")
+                    add_log("自动推荐", f"收敛异常，使用当前最优: {top_candidate.get('名称', '')}")
                     st.rerun()
-            except Exception as e:
-                st.error(f"最终推荐出错: {str(e)}")
-                add_log("自动推荐", f"最终锁定异常: {str(e)[:50]}")
-                st.session_state.locked = False
+            else:
+                # 历史记录不足，直接用当前最优
+                st.session_state.final_pick = {
+                    'name': top_candidate.get('名称', ''),
+                    'code': top_candidate.get('代码', ''),
+                    '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
+                    '成交额': float(top_candidate.get('成交额', 0)),
+                    'time': current_time_str,
+                    'auto': True,
+                    'risk_adjusted_score': float(top_candidate.get('风险调整得分', 0)),
+                    'composite_score': float(top_candidate.get('综合得分', 0)),
+                    'sector': strongest_sector if strongest_sector else '全市场',
+                    'data_source': st.session_state.data_source
+                }
+                st.session_state.locked = True
+                st.session_state.final_candidates = []
+                add_log("自动推荐", f"历史记录不足，使用当前最优: {top_candidate.get('名称', '')}")
+                st.rerun()
         else:
             st.info("⏸️ 等待真实数据或合适标的")
 
@@ -979,6 +1062,7 @@ with col_rec2:
         </div>
         """, unsafe_allow_html=True)
 
+        # 新增：显示备选
         if st.session_state.final_candidates and len(st.session_state.final_candidates) > 0:
             st.markdown("#### 🔄 备选股票")
             for i, cand in enumerate(st.session_state.final_candidates, 1):
