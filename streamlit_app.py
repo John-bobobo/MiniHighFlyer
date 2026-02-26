@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.4 · Tushare 专用版（优化版）
+尾盘博弈 6.5 · Tushare 专用版（趋势增强版）
 ===================================================
 ✅ 数据源：仅 Tushare rt_k 接口（支持全市场实时日K行情）
 ✅ 按板块通配符分批获取，覆盖沪深北所有股票
@@ -10,6 +10,7 @@
 ✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
 ✅ 新增：真实因子（振幅、回落、相对强度）、炸板剔除、涨幅>6.5%剔除
 ✅ 新增：14:00后漏斗记录，14:40收敛推荐并给出备选
+✅ 优化：利用历史日线数据计算MACD、均线排列等趋势指标，替换原固定量比因子，增强次日上涨确定性
 """
 
 import streamlit as st
@@ -17,13 +18,13 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.4 · Tushare 专用版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.5 · Tushare 专用版", layout="wide")
 
 # ===============================
 # 🔑 从 Streamlit Secrets 读取 Tushare Token
@@ -66,8 +67,9 @@ default_session_vars = {
     "last_data_fetch_time": None,
     "data_fetch_attempts": 0,
     "a_code_list": None,
-    "candidate_history": [],        # 新增：14:00后候选记录
-    "final_candidates": None,       # 新增：最终备选列表
+    "candidate_history": [],        # 14:00后候选记录
+    "final_candidates": None,       # 最终备选列表
+    "hist_data_cache": {},          # 新增：历史数据缓存，键为股票代码，值为DataFrame
 }
 
 for key, default in default_session_vars.items():
@@ -248,11 +250,42 @@ def get_stable_realtime_data():
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 多因子选股引擎（优化版）
+# 辅助函数：获取股票历史日线数据（带缓存）
+# ===============================
+def get_hist_data_cached(ts_code):
+    """
+    从缓存或Tushare获取股票近30个交易日的历史日线数据
+    返回DataFrame，包含日期和close等字段，按日期正序排列
+    """
+    # 检查缓存
+    if ts_code in st.session_state.hist_data_cache:
+        return st.session_state.hist_data_cache[ts_code]
+
+    try:
+        # 计算起始日期（30天前）
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=60)).strftime('%Y%m%d')  # 多取一些，保证有足够数据
+        df_hist = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        if df_hist is not None and not df_hist.empty:
+            df_hist = df_hist.sort_values('trade_date').reset_index(drop=True)
+            # 只保留近30条（约30个交易日）
+            df_hist = df_hist.tail(30)
+            st.session_state.hist_data_cache[ts_code] = df_hist
+            return df_hist
+        else:
+            st.session_state.hist_data_cache[ts_code] = None
+            return None
+    except Exception as e:
+        add_log("历史数据", f"{ts_code} 获取失败: {str(e)[:30]}")
+        st.session_state.hist_data_cache[ts_code] = None
+        return None
+
+# ===============================
+# 多因子选股引擎（优化版，增加趋势因子）
 # ===============================
 def get_technical_indicators(df, sector_avg_dict=None):
     """
-    计算真实技术因子
+    计算真实技术因子，并利用历史数据计算趋势得分，赋值给量比因子
     df: 包含实时行情字段的DataFrame（必须含有open, high, low, close, pre_close, 成交额, 成交量, 所属行业）
     sector_avg_dict: 行业平均涨幅字典（可选，用于计算相对强度）
     """
@@ -278,16 +311,63 @@ def get_technical_indicators(df, sector_avg_dict=None):
     else:
         df_factor['相对强度'] = df_factor['涨跌幅']  # 若无行业平均，则直接用涨幅
 
+    # ========== 新增：基于历史数据的趋势因子 ==========
+    # 为每只股票获取历史日线数据，计算MACD金叉、均线多头等，综合为趋势得分
+    trend_scores = []
+    for idx, row in df_factor.iterrows():
+        ts_code = row['代码']
+        hist_df = get_hist_data_cached(ts_code)
+        if hist_df is not None and len(hist_df) >= 20:  # 至少20个交易日数据
+            close = hist_df['close'].values
+            # 计算MACD
+            # 使用pandas的ewm计算指数移动平均
+            exp12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
+            exp26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
+            diff = exp12 - exp26
+            dea = pd.Series(diff).ewm(span=9, adjust=False).mean().values
+            macd_hist = (diff - dea) * 2
+
+            # 最新交易日指标
+            latest_diff = diff[-1]
+            latest_dea = dea[-1]
+            latest_macd_hist = macd_hist[-1]
+            # 判断金叉状态
+            golden_cross = 1 if latest_diff > latest_dea else 0
+
+            # 计算均线
+            ma5 = pd.Series(close).rolling(5).mean().values
+            ma10 = pd.Series(close).rolling(10).mean().values
+            ma20 = pd.Series(close).rolling(20).mean().values
+
+            # 判断多头排列（MA5 > MA10 > MA20）
+            bull_arrangement = 1 if (ma5[-1] > ma10[-1] > ma20[-1]) else 0
+
+            # MACD柱正值表示多头动能
+            macd_positive = 1 if latest_macd_hist > 0 else 0
+
+            # 趋势得分：金叉(1) + 多头排列(1) + MACD柱正(0.5) 归一化到0-1
+            raw_score = golden_cross + bull_arrangement + macd_positive * 0.5
+            max_raw = 2.5  # 最大可能得分
+            trend_score = raw_score / max_raw
+        else:
+            trend_score = 0.5  # 无历史数据时中性
+
+        trend_scores.append(trend_score)
+
+    df_factor['趋势得分'] = trend_scores
+
+    # 将趋势得分赋值给“量比”因子（原为固定1.0，现替换为趋势得分）
+    df_factor['量比'] = df_factor['趋势得分']
+
     # 映射到原有因子名称（保持权重滑块有效）
     # 涨跌幅 -> 涨跌幅（直接用）
     # 成交额 -> 成交额（直接用）
     # 5日动量 -> 相对强度（替代）
     # 20日反转 -> 回落幅度（替代，注意我们希望回落小，所以后续排序时用负向？）
-    # 量比 -> 暂设为1.0（无法计算，后续可考虑用成交额分位数）
+    # 量比 -> 已替换为趋势得分
     # 波动率 -> 振幅（替代）
     df_factor['5日动量'] = df_factor['相对强度']
     df_factor['20日反转'] = -df_factor['回落幅度']  # 反转因子我们期望回落小（即正值大），所以取负，使回落小的股票得分高
-    df_factor['量比'] = 1.0  # 暂时固定
     df_factor['波动率'] = df_factor['振幅']
 
     return df_factor
@@ -395,7 +475,7 @@ def converge_candidates(history, latest_scored_df, top_n=3):
 # 主程序开始
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.4 · Tushare 专用版（优化版）")
+st.title("🔥 尾盘博弈 6.5 · Tushare 专用版（趋势增强版）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日自动清空
@@ -409,6 +489,7 @@ if st.session_state.today != now.date():
     st.session_state.a_code_list = None
     st.session_state.candidate_history = []   # 清空历史记录
     st.session_state.final_candidates = None
+    st.session_state.hist_data_cache = {}     # 清空历史数据缓存
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
@@ -445,6 +526,7 @@ with st.sidebar:
         st.session_state.a_code_list = None
         st.session_state.candidate_history = []   # 清空历史记录
         st.session_state.final_candidates = None
+        st.session_state.hist_data_cache = {}     # 清空历史数据缓存
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
         st.rerun()
@@ -472,7 +554,7 @@ with st.sidebar:
     w_volume = st.slider("成交额", 0.0, 0.5, 0.20, 0.05, key="w_volume")
     w_momentum = st.slider("5日动量", 0.0, 0.4, 0.18, 0.05, key="w_momentum")
     w_reversal = st.slider("20日反转", 0.0, 0.3, 0.15, 0.05, key="w_reversal")
-    w_vol_ratio = st.slider("量比", 0.0, 0.3, 0.12, 0.05, key="w_vol_ratio")
+    w_vol_ratio = st.slider("量比（趋势因子）", 0.0, 0.3, 0.12, 0.05, key="w_vol_ratio")  # 修改提示
     w_volatility = st.slider("波动率(负)", -0.2, 0.0, -0.10, 0.05, key="w_volatility")
     total_weight = w_price + w_volume + w_momentum + w_reversal + w_vol_ratio + w_volatility
     if abs(total_weight - 1.0) > 0.2:
@@ -523,6 +605,7 @@ with st.sidebar:
             st.session_state.a_code_list = None
             st.session_state.candidate_history = []
             st.session_state.final_candidates = None
+            st.session_state.hist_data_cache = {}
             st.success("已清除今日数据缓存")
             st.rerun()
 
