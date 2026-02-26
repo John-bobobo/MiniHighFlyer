@@ -684,7 +684,8 @@ with col3:
         st.metric("推荐状态", "🟡 观察中")
 with col4:
     if period == "午盘" and current_hour >= 14:
-        close_time = datetime(current_time.year, current_time.month, current_time.day, 15, 0)
+        # 修复：使用 replace 创建带时区的收盘时间，避免时区不匹配错误
+        close_time = current_time.replace(hour=15, minute=0, second=0, microsecond=0)
         time_left = close_time - current_time
         minutes_left = max(0, int(time_left.total_seconds() / 60))
         st.metric("距离收盘", f"{minutes_left}分钟")
