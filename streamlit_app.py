@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.5 · Tushare 专用版（趋势增强版）
+尾盘博弈 6.5 · Tushare 专用版（趋势增强版，稳定修复）
 ===================================================
 ✅ 数据源：仅 Tushare rt_k 接口（支持全市场实时日K行情）
 ✅ 按板块通配符分批获取，覆盖沪深北所有股票
@@ -10,7 +10,8 @@
 ✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
 ✅ 新增：真实因子（振幅、回落、相对强度）、炸板剔除、涨幅>6.5%剔除
 ✅ 新增：14:00后漏斗记录，14:40收敛推荐并给出备选
-✅ 优化：利用历史日线数据计算MACD、均线排列等趋势指标，替换原固定量比因子，增强次日上涨确定性
+✅ 优化：利用历史日线数据计算MACD、均线排列等趋势指标，替换原固定量比因子
+✅ 修复：单只股票历史数据异常不影响整体选股，确保引擎稳定运行
 """
 
 import streamlit as st
@@ -281,7 +282,7 @@ def get_hist_data_cached(ts_code):
         return None
 
 # ===============================
-# 多因子选股引擎（优化版，增加趋势因子）
+# 多因子选股引擎（优化版，增加趋势因子，带异常处理）
 # ===============================
 def get_technical_indicators(df, sector_avg_dict=None):
     """
@@ -311,63 +312,58 @@ def get_technical_indicators(df, sector_avg_dict=None):
     else:
         df_factor['相对强度'] = df_factor['涨跌幅']  # 若无行业平均，则直接用涨幅
 
-    # ========== 新增：基于历史数据的趋势因子 ==========
-    # 为每只股票获取历史日线数据，计算MACD金叉、均线多头等，综合为趋势得分
+    # ========== 趋势因子计算（增加异常处理）==========
     trend_scores = []
     for idx, row in df_factor.iterrows():
         ts_code = row['代码']
-        hist_df = get_hist_data_cached(ts_code)
-        if hist_df is not None and len(hist_df) >= 20:  # 至少20个交易日数据
-            close = hist_df['close'].values
-            # 计算MACD
-            # 使用pandas的ewm计算指数移动平均
-            exp12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
-            exp26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
-            diff = exp12 - exp26
-            dea = pd.Series(diff).ewm(span=9, adjust=False).mean().values
-            macd_hist = (diff - dea) * 2
+        try:  # 关键：捕获单只股票的历史数据计算异常
+            hist_df = get_hist_data_cached(ts_code)
+            if hist_df is not None and len(hist_df) >= 20:
+                close = hist_df['close'].values
+                # 计算MACD
+                exp12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
+                exp26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
+                diff = exp12 - exp26
+                dea = pd.Series(diff).ewm(span=9, adjust=False).mean().values
+                macd_hist = (diff - dea) * 2
 
-            # 最新交易日指标
-            latest_diff = diff[-1]
-            latest_dea = dea[-1]
-            latest_macd_hist = macd_hist[-1]
-            # 判断金叉状态
-            golden_cross = 1 if latest_diff > latest_dea else 0
+                latest_diff = diff[-1]
+                latest_dea = dea[-1]
+                latest_macd_hist = macd_hist[-1]
+                golden_cross = 1 if latest_diff > latest_dea else 0
 
-            # 计算均线
-            ma5 = pd.Series(close).rolling(5).mean().values
-            ma10 = pd.Series(close).rolling(10).mean().values
-            ma20 = pd.Series(close).rolling(20).mean().values
+                # 计算均线
+                ma5 = pd.Series(close).rolling(5).mean().values
+                ma10 = pd.Series(close).rolling(10).mean().values
+                ma20 = pd.Series(close).rolling(20).mean().values
 
-            # 判断多头排列（MA5 > MA10 > MA20）
-            bull_arrangement = 1 if (ma5[-1] > ma10[-1] > ma20[-1]) else 0
+                bull_arrangement = 1 if (ma5[-1] > ma10[-1] > ma20[-1]) else 0
+                macd_positive = 1 if latest_macd_hist > 0 else 0
 
-            # MACD柱正值表示多头动能
-            macd_positive = 1 if latest_macd_hist > 0 else 0
-
-            # 趋势得分：金叉(1) + 多头排列(1) + MACD柱正(0.5) 归一化到0-1
-            raw_score = golden_cross + bull_arrangement + macd_positive * 0.5
-            max_raw = 2.5  # 最大可能得分
-            trend_score = raw_score / max_raw
-        else:
-            trend_score = 0.5  # 无历史数据时中性
-
+                raw_score = golden_cross + bull_arrangement + macd_positive * 0.5
+                max_raw = 2.5
+                trend_score = raw_score / max_raw
+            else:
+                trend_score = 0.5
+        except Exception as e:
+            # 记录异常并赋予中性值
+            add_log("趋势计算", f"{ts_code} 异常: {str(e)[:30]}")
+            trend_score = 0.5
         trend_scores.append(trend_score)
 
-    df_factor['趋势得分'] = trend_scores
+    # 确保trend_scores长度与df_factor一致
+    if len(trend_scores) == len(df_factor):
+        df_factor['趋势得分'] = trend_scores
+    else:
+        # 如果长度不匹配（理论上不会），则全部设为默认值
+        df_factor['趋势得分'] = 0.5
 
-    # 将趋势得分赋值给“量比”因子（原为固定1.0，现替换为趋势得分）
+    # 将趋势得分赋值给“量比”因子
     df_factor['量比'] = df_factor['趋势得分']
 
-    # 映射到原有因子名称（保持权重滑块有效）
-    # 涨跌幅 -> 涨跌幅（直接用）
-    # 成交额 -> 成交额（直接用）
-    # 5日动量 -> 相对强度（替代）
-    # 20日反转 -> 回落幅度（替代，注意我们希望回落小，所以后续排序时用负向？）
-    # 量比 -> 已替换为趋势得分
-    # 波动率 -> 振幅（替代）
+    # 映射到原有因子名称
     df_factor['5日动量'] = df_factor['相对强度']
-    df_factor['20日反转'] = -df_factor['回落幅度']  # 反转因子我们期望回落小（即正值大），所以取负，使回落小的股票得分高
+    df_factor['20日反转'] = -df_factor['回落幅度']
     df_factor['波动率'] = df_factor['振幅']
 
     return df_factor
@@ -554,7 +550,7 @@ with st.sidebar:
     w_volume = st.slider("成交额", 0.0, 0.5, 0.20, 0.05, key="w_volume")
     w_momentum = st.slider("5日动量", 0.0, 0.4, 0.18, 0.05, key="w_momentum")
     w_reversal = st.slider("20日反转", 0.0, 0.3, 0.15, 0.05, key="w_reversal")
-    w_vol_ratio = st.slider("量比（趋势因子）", 0.0, 0.3, 0.12, 0.05, key="w_vol_ratio")  # 修改提示
+    w_vol_ratio = st.slider("量比（趋势因子）", 0.0, 0.3, 0.12, 0.05, key="w_vol_ratio")
     w_volatility = st.slider("波动率(负)", -0.2, 0.0, -0.10, 0.05, key="w_volatility")
     total_weight = w_price + w_volume + w_momentum + w_reversal + w_vol_ratio + w_volatility
     if abs(total_weight - 1.0) > 0.2:
