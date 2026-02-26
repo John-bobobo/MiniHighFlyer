@@ -10,6 +10,7 @@
 ✅ 板块分析、多因子权重可调、模拟时间测试、缓存管理
 ✅ 新增：真实技术指标（MACD/均线/量比/炸板过滤/低位放量/板块轮动）
 ✅ 新增：14:00-14:40 收敛记录，14:40 自动锁定最终推荐+2备选
+✅ 修改：交易时段每次刷新强制获取最新实时数据（不依赖缓存），满足每分钟50次调用限制
 """
 
 import streamlit as st
@@ -189,37 +190,32 @@ def fetch_from_tushare():
         return None
 
 def get_stable_realtime_data():
-    """主数据获取函数：仅使用 Tushare，并缓存结果"""
+    """主数据获取函数：每次在交易时间都重新从Tushare获取最新数据，并更新缓存"""
     now = datetime.now(tz)
 
-    # 如果有今日缓存，直接返回
-    if st.session_state.today_real_data is not None:
-        st.session_state.data_source = "cached_real_data"
-        st.session_state.last_data_fetch_time = now
-        add_log("数据", "使用今日缓存")
-        return st.session_state.today_real_data
-
-    # 非交易时间直接返回空 DataFrame（不缓存）
+    # 判断是否交易时间
     is_trading, msg = is_trading_day_and_time(now)
     if not is_trading:
-        add_log("数据", f"{msg}，返回空数据")
+        # 非交易时间：返回空数据，数据源标记为非交易，不更新缓存
         st.session_state.data_source = "non_trading"
         st.session_state.last_data_fetch_time = now
+        add_log("数据", f"{msg}，返回空数据")
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
-    # 只尝试 Tushare
+    # 交易时间：强制从Tushare获取最新数据
     df = fetch_from_tushare()
     if df is not None and not df.empty:
+        # 更新缓存
         st.session_state.today_real_data = df.copy()
         st.session_state.data_source = "real_data"
         st.session_state.last_data_fetch_time = now
-        add_log("数据源", "最终使用 Tushare")
+        add_log("数据源", "成功获取实时数据并更新缓存")
         return df
     else:
-        # Tushare 失败
-        add_log("数据源", "Tushare 失败，返回空DataFrame")
+        # 获取失败：返回空DataFrame，数据源标记为失败，缓存保持不变（如果有的话）
         st.session_state.data_source = "failed"
         st.session_state.last_data_fetch_time = now
+        add_log("数据源", "Tushare 获取失败，返回空")
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 def get_historical_data(ts_code, end_date=None):
@@ -829,7 +825,6 @@ else:
         if '20日反转' not in df_with_tech.columns:
             df_with_tech['20日反转'] = -df_with_tech['涨跌幅'] * 0.3
         if '量比' not in df_with_tech.columns:
-            # 修复：正确获取 vol_ratio_real 列
             if 'vol_ratio_real' in df_with_tech.columns:
                 df_with_tech['量比'] = df_with_tech['vol_ratio_real']
             else:
