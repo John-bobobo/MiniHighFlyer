@@ -11,6 +11,7 @@
 ✅ 新增：真实技术指标（MACD/均线/量比/炸板过滤/低位放量/板块轮动）
 ✅ 新增：14:00-14:40 收敛记录，14:40 自动锁定最终推荐+2备选
 ✅ 修改：交易时段每次刷新强制获取最新实时数据（不依赖缓存），满足每分钟50次调用限制
+✅ 优化：历史数据获取使用前复权（adj='qfq'），避免除权影响；关键请求添加重试机制，提升容错性
 """
 
 import streamlit as st
@@ -105,7 +106,7 @@ def is_trading_day_and_time(now=None):
 # Tushare 数据获取（仅此一家）
 # ===============================
 def fetch_from_tushare():
-    """从 Tushare rt_k 接口获取实时行情（按板块分批）"""
+    """从 Tushare rt_k 接口获取实时行情（按板块分批），带重试"""
     try:
         add_log("数据源", "尝试 Tushare rt_k 接口")
 
@@ -122,17 +123,23 @@ def fetch_from_tushare():
         all_dfs = []
 
         for pattern in board_patterns:
-            try:
-                # 单次请求，使用通配符
-                df_part = pro.rt_k(ts_code=pattern)
-                if df_part is not None and not df_part.empty:
-                    all_dfs.append(df_part)
-                    add_log("数据源", f"板块 {pattern} 获取到 {len(df_part)} 条")
-                else:
-                    add_log("数据源", f"板块 {pattern} 返回空数据")
-            except Exception as e:
-                add_log("数据源", f"板块 {pattern} 异常: {str(e)[:50]}")
-                continue
+            # 为每个板块请求添加重试
+            for attempt in range(3):
+                try:
+                    df_part = pro.rt_k(ts_code=pattern)
+                    if df_part is not None and not df_part.empty:
+                        all_dfs.append(df_part)
+                        add_log("数据源", f"板块 {pattern} 获取到 {len(df_part)} 条")
+                    else:
+                        add_log("数据源", f"板块 {pattern} 返回空数据")
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    if attempt == 2:  # 最后一次尝试失败
+                        add_log("数据源", f"板块 {pattern} 重试{attempt+1}次后仍异常: {str(e)[:50]}")
+                    else:
+                        add_log("数据源", f"板块 {pattern} 异常，正在重试({attempt+1}/3): {str(e)[:50]}")
+                        time.sleep(2)  # 重试前等待2秒
+                    continue
 
         if not all_dfs:
             add_log("数据源", "所有板块均失败，无数据")
@@ -219,29 +226,36 @@ def get_stable_realtime_data():
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 def get_historical_data(ts_code, end_date=None):
-    """获取个股历史日线数据（缓存），返回DataFrame，包含收盘价、成交量等"""
+    """获取个股历史日线数据（前复权），带重试，返回DataFrame，包含收盘价、成交量等"""
     cache = st.session_state.hist_data_cache
     if ts_code in cache:
         return cache[ts_code]
 
-    # 如果不在缓存中，从Tushare获取最近60个交易日数据
-    try:
-        if end_date is None:
-            end_date = datetime.now(tz).strftime('%Y%m%d')
-        df = pro.daily(ts_code=ts_code, end_date=end_date, limit=60)
-        if df is not None and not df.empty:
-            # 按日期排序
-            df = df.sort_values('trade_date')
-            cache[ts_code] = df
-            add_log("历史数据", f"获取 {ts_code} 成功 {len(df)} 条")
-            return df
-        else:
-            cache[ts_code] = pd.DataFrame()
-            return pd.DataFrame()
-    except Exception as e:
-        add_log("历史数据", f"{ts_code} 获取失败: {str(e)[:50]}")
-        cache[ts_code] = pd.DataFrame()
-        return pd.DataFrame()
+    # 如果不在缓存中，从Tushare获取最近60个交易日数据（前复权）
+    for attempt in range(3):
+        try:
+            if end_date is None:
+                end_date = datetime.now(tz).strftime('%Y%m%d')
+            df = pro.daily(ts_code=ts_code, end_date=end_date, limit=60, adj='qfq')  # 添加前复权
+            if df is not None and not df.empty:
+                # 按日期排序
+                df = df.sort_values('trade_date')
+                cache[ts_code] = df
+                add_log("历史数据", f"获取 {ts_code} 成功 {len(df)} 条")
+                return df
+            else:
+                cache[ts_code] = pd.DataFrame()
+                return pd.DataFrame()
+        except Exception as e:
+            if attempt == 2:
+                add_log("历史数据", f"{ts_code} 重试3次后仍失败: {str(e)[:50]}")
+            else:
+                add_log("历史数据", f"{ts_code} 获取失败，正在重试({attempt+1}/3): {str(e)[:50]}")
+                time.sleep(2)
+            continue
+
+    cache[ts_code] = pd.DataFrame()
+    return pd.DataFrame()
 
 # ===============================
 # 增强的因子计算函数
