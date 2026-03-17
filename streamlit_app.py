@@ -244,7 +244,7 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 增强的因子计算函数
+# 增强的因子计算函数（优化版本）
 # ===============================
 def filter_stocks_by_rule(df):
     """硬性规则过滤（增加炸板过滤和过高涨幅过滤）"""
@@ -267,7 +267,7 @@ def filter_stocks_by_rule(df):
     return filtered
 
 def calculate_technical_indicators(hist_df):
-    """从历史DataFrame计算技术指标，返回字典"""
+    """从历史DataFrame计算技术指标，返回字典（优化版本：增加真实动量因子和站上20日线）"""
     if hist_df.empty or len(hist_df) < 20:
         return {}
     # 确保按日期升序
@@ -309,6 +309,13 @@ def calculate_technical_indicators(hist_df):
     # 判断均线多头排列（5>10>20）
     bull_mas = (ma5 > ma10) and (ma10 > ma20) if not any(np.isnan([ma5, ma10, ma20])) else False
 
+    # ✨ 优化：计算真实5日动量和20日反转
+    momentum_5d = (close[-1] / close[-5] - 1) * 100 if len(close) >= 5 else np.nan
+    reversal_20d = (close[-1] / close[-20] - 1) * 100 if len(close) >= 20 else np.nan
+
+    # ✨ 优化：判断是否站上20日均线
+    above_ma20 = cur_close > ma20 if not np.isnan(ma20) else False
+
     return {
         'ma5': ma5,
         'ma10': ma10,
@@ -318,10 +325,13 @@ def calculate_technical_indicators(hist_df):
         'low_distance': low_distance,
         'avg_vol_20': avg_vol_20,
         'bull_mas': bull_mas,
+        'momentum_5d': momentum_5d,        # ✨ 新增
+        'reversal_20d': reversal_20d,      # ✨ 新增
+        'above_ma20': above_ma20,          # ✨ 新增
     }
 
 def add_technical_indicators(df, top_n=200):
-    """为df中的股票添加技术指标（基于历史数据），只对前top_n只计算（节省请求）"""
+    """为df中的股票添加技术指标（基于历史数据），只对前top_n只计算（节省请求）优化版本：加入新指标"""
     if df.empty:
         return df
 
@@ -349,6 +359,9 @@ def add_technical_indicators(df, top_n=200):
                 'low_distance': np.nan,
                 'vol_ratio_real': np.nan,
                 'bull_mas': False,
+                'momentum_5d': np.nan,       # ✨ 新增
+                'reversal_20d': np.nan,       # ✨ 新增
+                'above_ma20': False,           # ✨ 新增
             })
         else:
             tech = calculate_technical_indicators(hist)
@@ -368,17 +381,21 @@ def add_technical_indicators(df, top_n=200):
                 'low_distance': tech.get('low_distance', np.nan),
                 'vol_ratio_real': vol_ratio_real,
                 'bull_mas': tech.get('bull_mas', False),
+                'momentum_5d': tech.get('momentum_5d', np.nan),   # ✨ 新增
+                'reversal_20d': tech.get('reversal_20d', np.nan), # ✨ 新增
+                'above_ma20': tech.get('above_ma20', False),       # ✨ 新增
             })
         result_list.append(new_row)
 
     result_df = df.copy()
     tech_df = pd.DataFrame(result_list)
     tech_cols = ['代码', 'ma5', 'ma10', 'ma20', 'macd_hist', 'macd_golden_cross',
-                 'low_distance', 'vol_ratio_real', 'bull_mas']
+                 'low_distance', 'vol_ratio_real', 'bull_mas', 'momentum_5d', 'reversal_20d', 'above_ma20']
     result_df = result_df.merge(tech_df[tech_cols], on='代码', how='left')
     fill_dict = {
         'macd_golden_cross': False,
         'bull_mas': False,
+        'above_ma20': False,
     }
     for col, val in fill_dict.items():
         if col in result_df.columns:
@@ -386,7 +403,7 @@ def add_technical_indicators(df, top_n=200):
     return result_df
 
 def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=None):
-    """多因子综合评分（扩展因子）"""
+    """多因子综合评分（扩展因子）优化版本：加大风险惩罚，增加above_ma20因子"""
     if df.empty:
         return df
     df_scored = df.copy()
@@ -395,9 +412,10 @@ def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=N
     # 基础因子
     for factor, weight in weights.items():
         if factor in df_scored.columns and weight != 0:
+            # ✨ 优化：确保因子列有数据，对NaN做降序处理（排在最后）
             valid = df_scored[factor].notna()
             if valid.sum() > 0:
-                rank = df_scored[factor].rank(pct=True, method='average')
+                rank = df_scored[factor].rank(pct=True, method='average', na_option='bottom')
                 rank = rank.fillna(0.5)
                 total_score += rank * weight
 
@@ -414,20 +432,26 @@ def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=N
     if 'bull_mas' in df_scored.columns:
         total_score += df_scored['bull_mas'].astype(float) * 0.05
 
+    # ✨ 优化：增加站上20日线加分
+    if 'above_ma20' in df_scored.columns:
+        total_score += df_scored['above_ma20'].astype(float) * 0.03
+
     if strongest_sector is not None and '所属行业' in df_scored.columns:
         sector_boost = (df_scored['所属行业'] == strongest_sector).astype(float) * 0.03
         total_score += sector_boost
 
     df_scored['综合得分'] = total_score
 
-    # 风险惩罚
+    # ✨ 优化：加大风险惩罚力度
     risk_penalty = np.zeros(len(df_scored))
     if '涨跌幅' in df_scored.columns:
         high_gain = df_scored['涨跌幅'].clip(lower=5, upper=10)
-        risk_penalty += (high_gain - 5) / 50 * 0.15
+        # 涨幅超过5%的部分每1%扣0.005，最高扣0.025
+        risk_penalty += (high_gain - 5) / 100 * 0.5   # 原为0.15/50 ≈ 0.003/%，现改为0.5/100 = 0.005/%
     if '波动率' in df_scored.columns:
         high_vol = df_scored['波动率'].clip(lower=5, upper=15)
-        risk_penalty += (high_vol - 5) / 50 * 0.10
+        # 波动率超过5%的部分每1%扣0.003，最高扣0.03
+        risk_penalty += (high_vol - 5) / 100 * 0.3   # 原为0.10/50 ≈ 0.002/%，现为0.3/100 = 0.003/%
 
     df_scored['风险调整得分'] = df_scored['综合得分'] - risk_penalty
     return df_scored.sort_values('风险调整得分', ascending=False)
@@ -822,9 +846,16 @@ else:
 
         # 确保因子列存在（用模拟值填充缺失）
         if '5日动量' not in df_with_tech.columns:
-            df_with_tech['5日动量'] = df_with_tech['涨跌幅']
+            # ✨ 优化：使用计算出的真实动量值填充，而非简单复制涨跌幅
+            if 'momentum_5d' in df_with_tech.columns:
+                df_with_tech['5日动量'] = df_with_tech['momentum_5d']
+            else:
+                df_with_tech['5日动量'] = df_with_tech['涨跌幅']  # 备用
         if '20日反转' not in df_with_tech.columns:
-            df_with_tech['20日反转'] = -df_with_tech['涨跌幅'] * 0.3
+            if 'reversal_20d' in df_with_tech.columns:
+                df_with_tech['20日反转'] = df_with_tech['reversal_20d']
+            else:
+                df_with_tech['20日反转'] = -df_with_tech['涨跌幅'] * 0.3  # 备用
         if '量比' not in df_with_tech.columns:
             if 'vol_ratio_real' in df_with_tech.columns:
                 df_with_tech['量比'] = df_with_tech['vol_ratio_real']
