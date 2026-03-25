@@ -12,7 +12,16 @@
 ✅ 新增：14:00-14:40 收敛记录，14:40 自动锁定最终推荐+2备选
 ✅ 修改：交易时段每次刷新强制获取最新实时数据（不依赖缓存），满足每分钟50次调用限制
 """
+import sys
+import streamlit as st
 
+st.write("Python 路径:", sys.path)
+try:
+    import tushare as ts
+    st.success("✅ tushare 导入成功")
+except ImportError as e:
+    st.error(f"❌ 导入失败: {e}")
+    st.stop()
 import streamlit as st
 import pandas as pd
 import numpy as np
