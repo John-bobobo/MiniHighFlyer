@@ -1,6 +1,6 @@
 streamlit
-tushare
-akshare
+tushare==1.4.26
+akshare==1.18.46
 pandas
 numpy
 pytz
