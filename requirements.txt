@@ -1,6 +1,6 @@
-streamlit
-tushare
-akshare
-pandas
-numpy
-pytz
+streamlit==1.55.0
+tushare==1.4.26
+akshare==1.18.46
+pandas==2.3.3
+numpy==2.4.3
+pytz==2026.1
