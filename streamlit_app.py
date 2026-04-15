@@ -40,7 +40,7 @@ st.set_page_config(page_title="尾盘博弈 6.3 · Tushare 专用版", layout="w
 # 请在 .streamlit/secrets.toml 中设置：
 # tushare_token = "你的40位token"
 try:
-    TUSHARE_TOKEN = "f3c98793832d985114ba69d5403b6fa91860839885f1ef18ecc69b80"
+    TUSHARE_TOKEN = "dea49fc606a0945a8d00408b7828e4b6c7fcb3172a750fdeba734add"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
