@@ -12,7 +12,16 @@
 ✅ 新增：14:00-14:40 收敛记录，14:40 自动锁定最终推荐+2备选
 ✅ 修改：交易时段每次刷新强制获取最新实时数据（不依赖缓存），满足每分钟50次调用限制
 """
+import sys
+import streamlit as st
 
+st.write("Python 路径:", sys.path)
+try:
+    import tushare as ts
+    st.success("✅ tushare 导入成功")
+except ImportError as e:
+    st.error(f"❌ 导入失败: {e}")
+    st.stop()
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -31,7 +40,7 @@ st.set_page_config(page_title="尾盘博弈 6.3 · Tushare 专用版", layout="w
 # 请在 .streamlit/secrets.toml 中设置：
 # tushare_token = "你的40位token"
 try:
-    TUSHARE_TOKEN = "7f85ea86ce467f3b9ab46b1fa1a5b9a71fe089dd0e57d12239899155"
+    TUSHARE_TOKEN = "dea49fc606a0945a8d00408b7828e4b6c7fcb3172a750fdeba734add"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
