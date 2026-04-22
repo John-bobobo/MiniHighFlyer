@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 低位横盘涨停策略（主板专用）
+尾盘博弈 6.3 · 低位横盘涨停策略（主板专用 · 参数可调）
 =========================================================
-✅ 选股逻辑完全按照需求：
-   1. 近120日从高点回落，跌幅＞25%
-   2. 价跌量缩企稳阶段（下跌段均量 < 上涨段均量×0.8）
-   3. 5日内出现过放量涨停（涨停日成交量 ≥ 前一日×2）
-   4. 涨停前5个交易日均量 ≤ 120日天量的30%（剔除涨停日）
+✅ 选股逻辑：
+   1. 近120日从高点回落，跌幅＞可调阈值（默认20%）
+   2. 价跌量缩企稳阶段（下跌段均量 < 上涨段均量×可调阈值，默认0.9）
+   3. 5日内出现过放量涨停（涨停日成交量 ≥ 前一日×可调倍数，默认1.5倍）
+   4. 涨停前5个交易日均量 ≤ 120日天量的可调比例（默认50%）
    5. 5日均线上穿20日均线
    6. 剔除 ST、停牌、退市股、创业板、科创板、北交所
+✅ 侧边栏可动态调整参数，无需修改代码
+✅ 全自动尾盘推荐（13:30-14:00 首推，14:40 锁定，可手动模拟）
 """
 import sys
 import streamlit as st
@@ -233,7 +235,7 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 选股策略核心函数（完全按需求优化）
+# 选股策略核心函数（参数可调）
 # ===============================
 def filter_stocks_by_rule(df):
     """基础过滤：剔除ST、涨幅过高、成交额过低、停牌"""
@@ -252,14 +254,13 @@ def filter_stocks_by_rule(df):
     # 停牌过滤（最新价和成交量已为正）
     return filtered
 
-def check_breakout_conditions(hist_df, current_price, current_vol):
+def check_breakout_conditions(hist_df, current_price, current_vol,
+                              drop_ratio_min=0.20,
+                              vol_shrink_max=0.9,
+                              limit_vol_ratio_min=1.5,
+                              pre_limit_avg_vol_max=0.50):
     """
-    检查是否满足：
-    1. 近120日高点回落 > 25%
-    2. 价跌量缩（下跌段均量 < 上涨段均量×0.8）
-    3. 5日内出现放量涨停（涨停日成交量 ≥ 前一日×2）
-    4. 涨停前5个交易日均量 ≤ 120日天量的30%（剔除涨停日）
-    5. 今日MA5金叉MA20
+    检查是否满足条件（参数可调）
     """
     if hist_df is None or hist_df.empty or len(hist_df) < 60:
         return False, {}
@@ -272,7 +273,6 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     low = hist_df['low'].values
     close = hist_df['close'].values
     vol = hist_df['vol'].values
-
     N = len(hist_df)
 
     # 1. 阶段高低点及跌幅
@@ -281,7 +281,7 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     if phase_high == 0:
         return False, {}
     drop_ratio = (phase_high - phase_low) / phase_high
-    if drop_ratio <= 0.25:
+    if drop_ratio < drop_ratio_min:
         return False, {}
 
     # 2. 价跌量缩
@@ -296,7 +296,7 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     down_avg_vol = np.mean(down_vols)
     if up_avg_vol == 0:
         return False, {}
-    if down_avg_vol >= up_avg_vol * 0.8:
+    if down_avg_vol >= up_avg_vol * vol_shrink_max:
         return False, {}
 
     # 3. 120日天量（包含今日成交量）
@@ -318,7 +318,7 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     pct_chg = (all_close[1:] / all_close[:-1] - 1)
     limit_up_flags = pct_chg >= limit_up_threshold
     vol_ratio = all_vol[1:] / all_vol[:-1]
-    double_vol_flags = vol_ratio >= 2.0   # ✅ 需求：2倍以上
+    double_vol_flags = vol_ratio >= limit_vol_ratio_min
 
     # 5日内是否存在放量涨停
     if len(limit_up_flags) < 5:
@@ -326,27 +326,25 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     last5_limit = limit_up_flags[-5:]
     last5_double = double_vol_flags[-5:]
     has_limit_double = any(last5_limit & last5_double)
-
     if not has_limit_double:
         return False, {}
 
-    # 5. 涨停前5个交易日均量 ≤ 天量×30%（剔除涨停日）
+    # 6. 涨停前5个交易日均量 ≤ 天量×阈值（剔除涨停日）
     non_limit_volumes = []
-    # 从历史最后一天往前找，收集非涨停日的成交量（最多取前5个）
     for i in range(-1, -len(limit_up_flags)-1, -1):
         if not limit_up_flags[i]:
             non_limit_volumes.append(all_vol[i])
         if len(non_limit_volumes) >= 5:
             break
-    if len(non_limit_volumes) < 3:   # 至少3个交易日
+    if len(non_limit_volumes) < 3:
         return False, {}
     avg_vol_before = np.mean(non_limit_volumes)
     if max_vol_120 == 0:
         return False, {}
-    if avg_vol_before > max_vol_120 * 0.30:   # ✅ 需求：30%
+    if avg_vol_before > max_vol_120 * pre_limit_avg_vol_max:
         return False, {}
 
-    # 6. MA5金叉MA20
+    # 7. MA5金叉MA20
     if len(all_close) < 20:
         return False, {}
     ma5 = pd.Series(all_close).rolling(5).mean()
@@ -367,7 +365,7 @@ def check_breakout_conditions(hist_df, current_price, current_vol):
     }
     return True, score_dict
 
-def select_stocks_by_breakout(df_real, max_calc=300):
+def select_stocks_by_breakout(df_real, max_calc=300, params=None):
     if df_real.empty:
         return pd.DataFrame()
 
@@ -381,6 +379,14 @@ def select_stocks_by_breakout(df_real, max_calc=300):
                                  filtered['成交额'].rank(pct=True, ascending=False) * 0.5
         filtered = filtered.sort_values('_tmp_score', ascending=False).head(max_calc)
 
+    if params is None:
+        params = {
+            'drop_ratio_min': 0.20,
+            'vol_shrink_max': 0.9,
+            'limit_vol_ratio_min': 1.5,
+            'pre_limit_avg_vol_max': 0.50,
+        }
+
     result_list = []
     for idx, row in filtered.iterrows():
         ts_code = row['代码']
@@ -391,11 +397,17 @@ def select_stocks_by_breakout(df_real, max_calc=300):
         current_vol = row['成交量'] if '成交量' in row else 0
         if current_price <= 0 or current_vol <= 0:
             continue
-        is_match, score_dict = check_breakout_conditions(hist_df, current_price, current_vol)
+        is_match, score_dict = check_breakout_conditions(
+            hist_df, current_price, current_vol,
+            drop_ratio_min=params['drop_ratio_min'],
+            vol_shrink_max=params['vol_shrink_max'],
+            limit_vol_ratio_min=params['limit_vol_ratio_min'],
+            pre_limit_avg_vol_max=params['pre_limit_avg_vol_max']
+        )
         if is_match:
             base_score = (score_dict['drop_ratio'] * 100) + \
                          ((1 - score_dict['vol_shrink_ratio']) * 50) + \
-                         ((0.30 - score_dict['avg_vol_before_ratio']) * 200) + \
+                         ((params['pre_limit_avg_vol_max'] - score_dict['avg_vol_before_ratio']) * 200) + \
                          (20 if score_dict['limit_up_today'] else 0) + \
                          (score_dict['ma5_ma20_gap'] * 100)
             result_list.append({
@@ -424,7 +436,7 @@ def select_stocks_by_breakout(df_real, max_calc=300):
 # 主程序（完整界面）
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 低位横盘涨停策略（主板专用）")
+st.title("🔥 尾盘博弈 6.3 · 低位横盘涨停策略（主板专用 · 参数可调）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # 跨日清空
@@ -443,7 +455,7 @@ if st.session_state.today != now.date():
     st.rerun()
 
 # ===============================
-# 侧边栏 - 控制面板
+# 侧边栏 - 控制面板 + 参数调节
 # ===============================
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
@@ -496,8 +508,12 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ⚙️ 多因子权重配置（本策略权重固定为低位形态评分，下方仅供参考）")
-    st.info("本策略使用低位横盘+放量涨停+金叉的综合评分，侧边栏权重未使用。")
+    st.markdown("#### 🎛️ 策略参数调节（放宽可增加信号）")
+    drop_ratio_min = st.slider("最小跌幅", 0.15, 0.35, 0.20, 0.01, format="%.2f", key="drop_ratio_min")
+    vol_shrink_max = st.slider("价跌量缩上限", 0.7, 1.0, 0.9, 0.01, key="vol_shrink_max")
+    limit_vol_ratio_min = st.slider("放量涨停倍数", 1.2, 3.0, 1.5, 0.1, key="limit_vol_ratio_min")
+    pre_limit_avg_vol_max = st.slider("涨停前均量/天量上限", 0.30, 0.80, 0.50, 0.01, key="pre_limit_avg_vol_max")
+    st.caption("当前参数下，符合条件的股票会显示在下方")
 
     if st.session_state.convergence_records:
         st.markdown(f"#### 📈 收敛记录数: {len(st.session_state.convergence_records)}")
@@ -653,7 +669,7 @@ except Exception as e:
     df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
 
 # ===============================
-# 板块分析与选股（简化为仅显示热度，不参与评分）
+# 板块热度分析（仅供参考）
 # ===============================
 st.markdown("### 📊 板块热度分析")
 if df.empty or '所属行业' not in df.columns:
@@ -696,19 +712,26 @@ else:
         strongest_sector = None
 
 # ===============================
-# 🎯 新选股引擎（低位横盘涨停策略）
+# 🎯 选股引擎（使用侧边栏参数）
 # ===============================
 st.markdown("### 🎯 低位横盘+放量涨停选股引擎")
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
     top_candidate = None
 else:
-    st.markdown("**策略条件**: 跌幅>25% | 价跌量缩 | 5日内放量涨停(≥2倍) | 涨停前5日均量≤天量30% | MA5金叉MA20")
+    # 收集侧边栏参数
+    strategy_params = {
+        'drop_ratio_min': drop_ratio_min,
+        'vol_shrink_max': vol_shrink_max,
+        'limit_vol_ratio_min': limit_vol_ratio_min,
+        'pre_limit_avg_vol_max': pre_limit_avg_vol_max,
+    }
+    st.markdown(f"**当前策略参数**: 跌幅>{drop_ratio_min:.0%} | 缩量上限{vol_shrink_max:.1f} | 放量≥{limit_vol_ratio_min:.1f}倍 | 涨停前均量≤天量{pre_limit_avg_vol_max:.0%}")
     with st.spinner("正在计算历史形态（可能需要几十秒）..."):
-        scored_df = select_stocks_by_breakout(df, max_calc=300)
+        scored_df = select_stocks_by_breakout(df, max_calc=300, params=strategy_params)
 
     if scored_df.empty:
-        st.warning("当前没有满足所有条件的股票，可适当放宽参数或等待更多信号。")
+        st.warning("当前没有满足所有条件的股票，可尝试在左侧侧边栏**放宽参数**（如提高涨停前均量上限、降低放量倍数等）。")
         top_candidate = None
         top_candidates = pd.DataFrame()
     else:
@@ -730,7 +753,7 @@ else:
                 '得分': [
                     top_candidate.get('跌幅幅度', '0%').rstrip('%'),
                     f"{(1 - top_candidate.get('vol_shrink_ratio', 0)) * 100:.1f}%",
-                    f"{(0.30 - top_candidate.get('avg_vol_before_ratio', 0)) * 100:.1f}分",
+                    f"{(pre_limit_avg_vol_max - top_candidate.get('avg_vol_before_ratio', 0)) * 100:.1f}分",
                     f"{top_candidate.get('ma5_ma20_gap', 0) * 100:.2f}%"
                 ]
             }
