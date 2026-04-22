@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 低位横盘涨停策略（剔除创业板/科创板/北交所）
+尾盘博弈 6.3 · 低位横盘涨停策略（主板专用）
 =========================================================
 ✅ 选股逻辑完全按照需求：
    1. 近120日从高点回落，跌幅＞25%
@@ -8,7 +8,7 @@
    3. 5日内出现过放量涨停（涨停日成交量 ≥ 前一日×2）
    4. 涨停前5个交易日均量 ≤ 120日天量的30%（剔除涨停日）
    5. 5日均线上穿20日均线
-   6. 剔除 ST、停牌、退市股
+   6. 剔除 ST、停牌、退市股、创业板、科创板、北交所
 """
 import sys
 import streamlit as st
@@ -421,7 +421,7 @@ def select_stocks_by_breakout(df_real, max_calc=300):
     return result_df
 
 # ===============================
-# 主程序（界面部分保持原有结构，仅调整标题和说明）
+# 主程序（完整界面）
 # ===============================
 now = datetime.now(tz)
 st.title("🔥 尾盘博弈 6.3 · 低位横盘涨停策略（主板专用）")
@@ -442,15 +442,261 @@ if st.session_state.today != now.date():
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
-# 侧边栏（略，保持原有功能，此处因篇幅省略相同代码，实际运行时请保留原侧边栏）
-# 由于代码长度限制，侧边栏和后续界面与原版基本一致，可沿用原文件中的侧边栏、时间监控、自动推荐等部分。
-# 为保持完整性，以下提供必要的界面框架，实际使用时请确保包含所有原有界面组件。
+# ===============================
+# 侧边栏 - 控制面板
+# ===============================
+with st.sidebar:
+    st.markdown("### 🎛️ 控制面板")
+    st.markdown("#### 📊 数据源状态")
+    data_source_display = {
+        "real_data": "🟢 **实时数据（Tushare rt_k）**",
+        "cached_real_data": "🟡 **缓存数据**",
+        "non_trading": "⚪ **非交易时间（无实时）**",
+        "unknown": "⚪ **等待获取**",
+        "failed": "🔴 **获取失败**"
+    }.get(st.session_state.data_source, "⚪ **等待获取**")
+    st.markdown(data_source_display)
 
-# 注意：以下为占位符，实际部署时应将原文件中的侧边栏、监控、推荐显示等代码完整复制过来。
-# 此处仅展示选股引擎替换后的核心逻辑，完整代码请参考附件或按上述函数替换。
+    if st.session_state.last_data_fetch_time:
+        time_diff = (datetime.now(tz) - st.session_state.last_data_fetch_time).total_seconds()
+        if time_diff < 60:
+            st.caption(f"最近更新: {int(time_diff)}秒前")
+        elif time_diff < 300:
+            st.caption(f"最近更新: {int(time_diff/60)}分钟前")
+        else:
+            st.caption(f"最近更新: >5分钟前")
+
+    st.markdown("---")
+    st.markdown("#### 🔧 数据源控制")
+    if st.button("🔄 强制刷新数据"):
+        st.cache_data.clear()
+        st.session_state.today_real_data = None
+        st.session_state.data_source = "unknown"
+        st.session_state.a_code_list = None
+        st.session_state.hist_data_cache = {}
+        add_log("手动操作", "清除缓存，强制刷新")
+        st.success("已清除缓存，将尝试重新获取")
+        st.rerun()
+
+    if st.session_state.data_fetch_attempts > 0:
+        st.info(f"数据获取尝试次数: {st.session_state.data_fetch_attempts}")
+
+    st.markdown("---")
+    st.markdown("#### ⏰ 时间设置")
+    use_real_time = st.radio("时间模式", ["实时模式", "模拟测试"], index=0, key="time_mode")
+    if use_real_time == "模拟测试":
+        col1, col2 = st.columns(2)
+        with col1:
+            test_hour = st.number_input("模拟小时", 9, 15, 14, key="test_hour")
+        with col2:
+            test_minute = st.number_input("模拟分钟", 0, 59, 30, key="test_minute")
+        if st.button("🕐 应用模拟时间"):
+            add_log("模拟", f"设置时间: {test_hour:02d}:{test_minute:02d}")
+            st.session_state.simulated_time = now.replace(hour=test_hour, minute=test_minute, second=0)
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### ⚙️ 多因子权重配置（本策略权重固定为低位形态评分，下方仅供参考）")
+    st.info("本策略使用低位横盘+放量涨停+金叉的综合评分，侧边栏权重未使用。")
+
+    if st.session_state.convergence_records:
+        st.markdown(f"#### 📈 收敛记录数: {len(st.session_state.convergence_records)}")
+
+    st.markdown("---")
+    st.markdown("#### 🎮 手动操作")
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("📈 测试上午推荐"):
+            if "test_top_stock" in st.session_state:
+                st.session_state.morning_pick = st.session_state.test_top_stock
+                add_log("手动操作", "设置上午推荐")
+                st.success("上午推荐已设置")
+                st.rerun()
+    with col_btn2:
+        if st.button("🎯 测试最终锁定"):
+            if "test_top_stock" in st.session_state:
+                st.session_state.final_pick = st.session_state.test_top_stock
+                st.session_state.locked = True
+                add_log("手动操作", "设置最终锁定")
+                st.success("最终锁定已设置")
+                st.rerun()
+    if st.button("🗑️ 清除所有推荐"):
+        st.session_state.morning_pick = None
+        st.session_state.final_pick = None
+        st.session_state.locked = False
+        st.session_state.backup_picks = []
+        add_log("手动操作", "清除所有推荐")
+        st.success("推荐已清除")
+        st.rerun()
+
+    st.markdown("---")
+    if st.session_state.today_real_data is not None and not st.session_state.today_real_data.empty:
+        st.markdown("#### 💾 数据缓存")
+        st.info(f"已缓存 {len(st.session_state.today_real_data)} 条今日数据")
+        if st.button("清除今日缓存"):
+            st.session_state.today_real_data = None
+            st.session_state.data_source = "unknown"
+            st.session_state.a_code_list = None
+            st.session_state.hist_data_cache = {}
+            st.success("已清除今日数据缓存")
+            st.rerun()
 
 # ===============================
-# 示例：选股引擎调用（需嵌入原界面）
+# 时间处理
+# ===============================
+if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
+    current_time = st.session_state.simulated_time
+    st.info(f"🔧 模拟时间: {current_time.strftime('%H:%M:%S')}")
+else:
+    current_time = now
+
+current_hour = current_time.hour
+current_minute = current_time.minute
+current_time_str = current_time.strftime("%H:%M:%S")
+
+# ===============================
+# 交易时段监控
+# ===============================
+st.markdown("### ⏰ 交易时段监控")
+is_trading, trading_msg = is_trading_day_and_time(current_time)
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    status_color = "🟢" if is_trading else "🔴"
+    st.metric("交易日状态", f"{status_color} {'交易日' if is_trading else '非交易日'}")
+with col2:
+    if 9 <= current_hour < 11 or (current_hour == 11 and current_minute <= 30):
+        period = "早盘"
+    elif 13 <= current_hour < 15 or (current_hour == 15 and current_minute <= 0):
+        period = "午盘"
+    else:
+        period = "休市"
+    st.metric("当前时段", period)
+with col3:
+    is_first_rec_time = (13, 30) <= (current_hour, current_minute) < (14, 0)
+    is_final_lock_time = (current_hour, current_minute) >= (14, 40)
+    if is_first_rec_time:
+        st.metric("推荐状态", "🟢 可推荐")
+    elif is_final_lock_time:
+        st.metric("推荐状态", "🔴 需锁定")
+    else:
+        st.metric("推荐状态", "🟡 观察中")
+with col4:
+    if period == "午盘" and current_hour >= 14:
+        close_time = current_time.replace(hour=15, minute=0, second=0, microsecond=0)
+        time_left = close_time - current_time
+        minutes_left = max(0, int(time_left.total_seconds() / 60))
+        st.metric("距离收盘", f"{minutes_left}分钟")
+    else:
+        st.metric("自动刷新", "30秒")
+
+# ===============================
+# 🚀 获取市场数据
+# ===============================
+st.markdown("### 📊 数据获取状态")
+try:
+    with st.spinner("正在获取实时数据..."):
+        df = get_stable_realtime_data()
+
+    data_source_status = {
+        "real_data": ("✅", "Tushare rt_k 实时行情", "#e6f7ff"),
+        "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
+        "non_trading": ("⏸️", "非交易时间（无实时）", "#f0f0f0"),
+        "unknown": ("⚪", "等待获取数据", "#f0f0f0"),
+        "failed": ("🔴", "数据获取失败", "#ffe6e6")
+    }
+    status_emoji, status_text, bg_color = data_source_status.get(
+        st.session_state.data_source, data_source_status["unknown"]
+    )
+    st.markdown(f"""
+    <div style="background-color: {bg_color}; padding: 10px 15px; border-radius: 5px; border-left: 4px solid #1890ff; margin: 10px 0;">
+        <strong>{status_emoji} 数据源状态:</strong> {status_text}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not df.empty:
+        st.success(f"✅ 成功获取 {len(df)} 条真实股票数据（已剔除创业板/科创板/北交所）")
+        with st.expander("🔍 查看数据样本"):
+            display_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+            display_cols = [c for c in display_cols if c in df.columns]
+            st.dataframe(df[display_cols].head(10))
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+            with col_stat1:
+                st.metric("平均涨幅", f"{df['涨跌幅'].mean():.2f}%")
+            with col_stat2:
+                st.metric("最高涨幅", f"{df['涨跌幅'].max():.2f}%")
+            with col_stat3:
+                if '成交额' in df.columns:
+                    st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
+    else:
+        if st.session_state.data_source == "non_trading":
+            st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
+        else:
+            st.warning("⚠️ 获取到的数据为空，可能原因：Tushare 权限不足、token错误或接口异常")
+except Exception as e:
+    st.error(f"❌ 数据获取失败: {str(e)}")
+    add_log("数据获取", f"最终失败: {str(e)}")
+    with st.expander("🔧 故障排除指南"):
+        st.markdown("""
+        ### Tushare 数据获取失败，可能原因：
+        - **Tushare token 错误或未填写** → 请检查 Secrets 中的 `tushare_token`
+        - **Tushare 权限不足** → 确认已开通“实时日K行情”权限
+        - **Tushare 版本过低** → 执行 `pip install --upgrade tushare`
+        - **当前非交易时间** → 实时行情只在交易时段（9:30-11:30, 13:00-15:00）提供
+        - **网络环境限制** → 某些服务器/IP 可能被 Tushare 封禁
+        """)
+    if st.button("🔄 立即重试"):
+        st.cache_data.clear()
+        st.session_state.today_real_data = None
+        st.session_state.data_source = "unknown"
+        st.session_state.a_code_list = None
+        st.rerun()
+    df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
+
+# ===============================
+# 板块分析与选股（简化为仅显示热度，不参与评分）
+# ===============================
+st.markdown("### 📊 板块热度分析")
+if df.empty or '所属行业' not in df.columns:
+    st.info("当前无有效板块数据，跳过板块分析。")
+    strongest_sector = None
+else:
+    try:
+        sector_analysis = df.groupby('所属行业').agg({
+            '涨跌幅': 'mean',
+            '成交额': 'sum',
+            '代码': 'count'
+        }).rename(columns={'代码': '股票数量'}).reset_index()
+        sector_analysis['平均涨幅'] = sector_analysis['涨跌幅']
+        sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
+        sector_analysis['强度得分'] = (
+            sector_analysis['平均涨幅'].rank(pct=True) * 40 +
+            sector_analysis['资金占比'].rank(pct=True) * 40 +
+            sector_analysis['股票数量'].rank(pct=True) * 20
+        )
+        sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
+        top_sectors = sector_analysis.head(5)
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if not top_sectors.empty:
+                st.bar_chart(top_sectors.set_index('所属行业')[['平均涨幅', '资金占比']])
+        with col2:
+            st.markdown("#### 🔥 热门板块")
+            if not top_sectors.empty:
+                for idx, row in top_sectors.iterrows():
+                    emoji = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][idx % 5]
+                    st.write(f"{emoji} **{row['所属行业']}**")
+                    st.progress(min(row['强度得分'] / 100, 1.0))
+
+        strongest_sector = top_sectors.iloc[0]['所属行业'] if not top_sectors.empty else None
+        if strongest_sector:
+            st.success(f"🏆 今日最强板块: **{strongest_sector}**")
+    except Exception as e:
+        st.error(f"板块分析错误: {str(e)}")
+        strongest_sector = None
+
+# ===============================
+# 🎯 新选股引擎（低位横盘涨停策略）
 # ===============================
 st.markdown("### 🎯 低位横盘+放量涨停选股引擎")
 if df.empty:
@@ -458,7 +704,7 @@ if df.empty:
     top_candidate = None
 else:
     st.markdown("**策略条件**: 跌幅>25% | 价跌量缩 | 5日内放量涨停(≥2倍) | 涨停前5日均量≤天量30% | MA5金叉MA20")
-    with st.spinner("正在计算历史形态..."):
+    with st.spinner("正在计算历史形态（可能需要几十秒）..."):
         scored_df = select_stocks_by_breakout(df, max_calc=300)
 
     if scored_df.empty:
@@ -468,4 +714,194 @@ else:
     else:
         top_candidates = scored_df.head(10)
         top_candidate = scored_df.iloc[0].to_dict()
-        # ... 后续显示代码与原界面相同
+
+        st.markdown("#### 📈 优选股票形态指标")
+        col_info, col_factors = st.columns([1, 2])
+        with col_info:
+            st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
+            st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
+            st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.2f}")
+            st.metric("**今日涨幅**", f"{top_candidate.get('涨跌幅', 0):.2f}%")
+            if '是否今天涨停' in top_candidate:
+                st.metric("**今日涨停**", "是" if top_candidate['是否今天涨停'] else "否")
+        with col_factors:
+            factor_data = {
+                '因子': ['跌幅深度', '缩量程度', '涨停前缩量', '金叉开口'],
+                '得分': [
+                    top_candidate.get('跌幅幅度', '0%').rstrip('%'),
+                    f"{(1 - top_candidate.get('vol_shrink_ratio', 0)) * 100:.1f}%",
+                    f"{(0.30 - top_candidate.get('avg_vol_before_ratio', 0)) * 100:.1f}分",
+                    f"{top_candidate.get('ma5_ma20_gap', 0) * 100:.2f}%"
+                ]
+            }
+            factor_df = pd.DataFrame(factor_data)
+            st.dataframe(factor_df, use_container_width=True)
+
+        st.markdown("#### 🏆 候选股票排名 (前5)")
+        if not top_candidates.empty:
+            display_cols = ['名称', '代码', '涨跌幅', '成交额', '综合得分', '是否今天涨停']
+            display_cols = [c for c in display_cols if c in top_candidates.columns]
+            display_df = top_candidates[display_cols].head().copy()
+            display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
+            display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
+            display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.2f}")
+            if '是否今天涨停' in display_df.columns:
+                display_df['是否今天涨停'] = display_df['是否今天涨停'].apply(lambda x: "✅" if x else "❌")
+            st.dataframe(display_df, use_container_width=True)
+
+        # 用于侧边栏手动测试
+        st.session_state.test_top_stock = {
+            'name': top_candidate.get('名称', ''),
+            'code': top_candidate.get('代码', ''),
+            '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
+            '成交额': float(top_candidate.get('成交额', 0)),
+            '综合得分': float(top_candidate.get('综合得分', 0)),
+            'risk_adjusted_score': float(top_candidate.get('综合得分', 0)),
+            'time': current_time_str,
+            'sector': strongest_sector if strongest_sector else '全市场',
+            'data_source': st.session_state.data_source
+        }
+
+# ===============================
+# 自动推荐（首次推荐）
+# ===============================
+st.markdown("### 🤖 自动推荐系统")
+use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
+if not use_real_data:
+    st.info("⏸️ 当前非交易时间或无实时数据，自动推荐已暂停")
+else:
+    if is_first_rec_time and st.session_state.morning_pick is None and top_candidate is not None:
+        st.session_state.morning_pick = {
+            'name': top_candidate.get('名称', ''),
+            'code': top_candidate.get('代码', ''),
+            '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
+            '成交额': float(top_candidate.get('成交额', 0)),
+            'time': current_time_str,
+            'auto': True,
+            'risk_adjusted_score': float(top_candidate.get('风险调整得分', 0)),
+            'composite_score': float(top_candidate.get('综合得分', 0)),
+            'sector': strongest_sector if strongest_sector else '全市场',
+            'data_source': st.session_state.data_source
+        }
+        add_log("自动推荐", f"生成首次推荐: {top_candidate.get('名称', '')}")
+        st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
+        st.rerun()
+
+# ===============================
+# 推荐显示区域
+# ===============================
+st.markdown("---")
+st.markdown("### 📋 推荐结果")
+col_rec1, col_rec2 = st.columns(2)
+with col_rec1:
+    st.subheader("🕐 首次推荐 (13:30-14:00)")
+    if st.session_state.morning_pick is not None:
+        pick = st.session_state.morning_pick
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
+        st.markdown(f"""
+        <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
+            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            <p><strong>📅 推荐时间:</strong> {pick['time']}</p>
+            <p><strong>📈 当前涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
+            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
+            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('composite_score', 'N/A'):.2f}</p>
+            <p><strong>⚖️ 风险调整得分:</strong> {pick.get('risk_adjusted_score', 'N/A'):.2f}</p>
+            <p><strong>🔧 来源:</strong> {'自动生成' if pick.get('auto', False) else '手动设置'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        if pick['涨跌幅'] > 6:
+            st.warning("📝 **操作建议**: 涨幅较大，建议观望或轻仓参与")
+        elif pick.get('涨跌幅', 0) < 0:
+            st.info("📝 **操作建议**: 当前下跌，观察是否有反弹机会")
+        else:
+            st.success("📝 **操作建议**: 可考虑逢低关注")
+    else:
+        if is_first_rec_time:
+            if use_real_data and top_candidate is not None:
+                st.info("⏳ 正在自动生成首次推荐...")
+            else:
+                st.info("⏸️ 等待真实数据或合适标的")
+        else:
+            st.info("⏰ 首次推荐时段: 13:30-14:00")
+
+with col_rec2:
+    st.subheader("🎯 最终锁定 (14:40后)")
+    if st.session_state.final_pick is not None:
+        pick = st.session_state.final_pick
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
+        st.markdown(f"""
+        <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
+            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            <p><strong>📅 锁定时间:</strong> {pick['time']}</p>
+            <p><strong>📈 锁定涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
+            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
+            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('composite_score', 'N/A'):.2f}</p>
+            <p><strong>⚖️ 风险调整得分:</strong> {pick.get('risk_adjusted_score', 'N/A'):.2f}</p>
+            <p><strong>🔒 状态:</strong> {'已锁定' if st.session_state.locked else '未锁定'}</p>
+            <p><strong>🔧 来源:</strong> {'自动锁定' if pick.get('auto', False) else '手动设置'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.session_state.backup_picks:
+            st.markdown("#### 🥈 备选推荐")
+            for i, b in enumerate(st.session_state.backup_picks, 1):
+                st.write(f"{i}. {b['name']} ({b['code']}) 涨幅 {b['涨跌幅']:.2f}%")
+        st.markdown("#### 📋 明日操作计划")
+        if pick['涨跌幅'] < 0:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "10-20%", "低仓位")
+            with col_b:
+                st.metric("止损位", "-3%", "严格止损")
+        elif pick['涨跌幅'] < 3:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "20-30%", "适中仓位")
+            with col_b:
+                st.metric("止损位", "-2%", "正常止损")
+        else:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "15-25%", "谨慎参与")
+            with col_b:
+                st.metric("止损位", "-2.5%", "适度止损")
+        st.info("💡 **提示**: 建议次日开盘观察10-30分钟再决定是否介入")
+    else:
+        if is_final_lock_time:
+            if use_real_data and top_candidate is not None:
+                st.info("⏳ 正在收敛计算最终推荐...")
+            else:
+                st.info("⏸️ 等待真实数据或合适标的")
+        else:
+            st.info("⏰ 最终锁定时段: 14:40后")
+
+# ===============================
+# 系统日志
+# ===============================
+with st.expander("📜 系统日志", expanded=False):
+    if st.session_state.logs:
+        for log in reversed(st.session_state.logs[-10:]):
+            color = "#3498db" if "成功" in log['event'] or "生成" in log['event'] else \
+                    "#e74c3c" if "失败" in log['event'] or "异常" in log['event'] else \
+                    "#f39c12" if "警告" in log['event'] or "延迟" in log['event'] else "#2c3e50"
+            st.markdown(f"""
+            <div style="border-left: 3px solid {color}; padding-left: 10px; margin: 5px 0;">
+                <strong>{log['timestamp']}</strong> - {log['event']}: {log['details']}
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("暂无日志记录")
+
+# ===============================
+# 自动刷新
+# ===============================
+if is_trading:
+    refresh_time = 30
+    st.write(f"⏳ {refresh_time}秒后自动刷新...")
+    time.sleep(refresh_time)
+    st.rerun()
+else:
+    st.info("⏸️ 当前非交易时间，自动刷新已暂停")
+    time.sleep(60)
+    st.rerun()
