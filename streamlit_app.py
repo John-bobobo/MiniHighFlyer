@@ -14,10 +14,7 @@
    - 14:15 自动锁定当前得分最高的股票作为“初次推荐”
    - 14:45 自动锁定当前得分最高的股票作为“最终推荐”
    - 推荐可手动覆盖，候选池始终可见
-✅ 板块获取：
-   - 优先调用 limit_cpt_list（需要 8000 积分）获取最强概念板块（仅展示参考）
-   - 实际过滤使用行业涨幅排名 Top5（通过 stock_basic 获取行业，需2000积分）
-✅ 胜率参考：2026 年 1-4 月回测，次日高开概率≈80%，涨超 3% 占比＞65%
+✅ Token 已内置（仅供个人测试，请勿泄露）
 """
 import sys
 import streamlit as st
@@ -41,16 +38,9 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="全天候动态选股 · 最强板块尾盘战法", layout="wide")
 
 # ===============================
-# 🔑 Tushare Token（从 secrets 读取）
+# 🔑 Tushare Token（已直接写入）
 # ===============================
-# 请在 .streamlit/secrets.toml 中设置：
-# tushare_token = "你的40位token"
-try:
-    TUSHARE_TOKEN = st.secrets["tushare_token"]
-except Exception:
-    st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
-    st.stop()
-
+TUSHARE_TOKEN = "14f338041757782cec740743e16402780823586b6426e1df2d71fb74"
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 
@@ -112,7 +102,6 @@ def get_top5_sectors(trade_date=None):
     """
     获取当天最强的 5 个行业板块（用于个股过滤）。
     同时尝试获取概念板块 Top5 用于展示。
-    注意：需要相应积分权限，否则返回默认行业列表。
     """
     if trade_date is None:
         trade_date = datetime.now(tz).strftime('%Y%m%d')
@@ -121,7 +110,7 @@ def get_top5_sectors(trade_date=None):
     if cache_key in st.session_state.sector_strength_cache:
         return st.session_state.sector_strength_cache[cache_key]
     
-    default_top5 = ['银行', '证券', '保险', '酿酒', '医药']  # 降级默认
+    default_top5 = ['银行', '证券', '保险', '酿酒', '医药']
     concept_top5 = []
     
     # 1. 尝试获取概念板块（需要 8000 积分，仅展示）
@@ -137,7 +126,6 @@ def get_top5_sectors(trade_date=None):
     
     # 2. 获取行业涨幅排名（用于实际过滤）
     try:
-        # 优先使用实时数据计算行业涨幅
         df = get_live_data(force_refresh=False)
         if df is not None and not df.empty and '所属行业' in df.columns:
             sector_stats = df.groupby('所属行业').agg({'涨跌幅': 'mean', '成交额': 'sum'}).reset_index()
@@ -147,7 +135,6 @@ def get_top5_sectors(trade_date=None):
             # 降级：使用全市场行业基础数据（取最活跃的几个行业）
             df_industry = pro.stock_basic(fields='ts_code,industry')
             if df_industry is not None and not df_industry.empty:
-                # 简单统计出现频率最高的行业
                 top_industries = df_industry['industry'].value_counts().head(5).index.tolist()
                 default_top5 = top_industries if top_industries else ['银行', '证券', '保险', '酿酒', '医药']
     except Exception as e:
@@ -157,7 +144,7 @@ def get_top5_sectors(trade_date=None):
     return default_top5
 
 # ===============================
-# 行业映射（用于个股行业字段，依赖 stock_basic 接口，需积分）
+# 行业映射（用于个股行业字段，依赖 stock_basic 接口）
 # ===============================
 def batch_get_stock_industry(ts_codes):
     """批量获取行业信息，缓存"""
@@ -165,7 +152,6 @@ def batch_get_stock_industry(ts_codes):
     need = [c for c in ts_codes if c not in cache]
     if need:
         try:
-            # 注意：stock_basic 接口需要积分（2000分起）
             df = pro.stock_basic(fields='ts_code,industry')
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
@@ -183,7 +169,6 @@ def fetch_from_tushare():
         all_dfs = []
         for pattern in board_patterns:
             try:
-                # 注意：rt_k 接口需要付费权限（实时行情）
                 df_part = pro.rt_k(ts_code=pattern)
                 if df_part is not None and not df_part.empty:
                     all_dfs.append(df_part)
@@ -248,7 +233,6 @@ def get_historical_data(ts_code, limit=60):
     if ts_code in cache:
         return cache[ts_code]
     try:
-        # daily 接口需要基础积分（120分以上）
         end_date = datetime.now(tz).strftime('%Y%m%d')
         df = pro.daily(ts_code=ts_code, end_date=end_date, limit=limit)
         if df is not None and not df.empty:
