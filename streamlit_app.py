@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-全天候动态选股 · 尾盘大涨战法（最强板块 Top5 过滤 + 实时排名展示）
+全天候动态选股 · 尾盘大涨战法（最强板块 Top5 过滤）
 =========================================================
-✅ 选股条件：
+✅ 选股条件（保持不变）：
    1. 收盘涨幅 2% - 6.5%
    2. 量比 1.2 - 1.8（温和放量）
    3. 日线三连阳 + 收盘站稳 5 日均线
@@ -16,7 +16,7 @@
    - 推荐可手动覆盖，候选池始终可见
 ✅ 板块获取：
    - 优先调用 limit_cpt_list（需要 8000 积分）获取最强概念板块（仅展示参考）
-   - 实际过滤使用行业涨幅排名 Top5（稳健）
+   - 实际过滤使用行业涨幅排名 Top5（通过 stock_basic 获取行业，需2000积分）
 ✅ 胜率参考：2026 年 1-4 月回测，次日高开概率≈80%，涨超 3% 占比＞65%
 """
 import sys
@@ -43,9 +43,11 @@ st.set_page_config(page_title="全天候动态选股 · 最强板块尾盘战法
 # ===============================
 # 🔑 Tushare Token（从 secrets 读取）
 # ===============================
+# 请在 .streamlit/secrets.toml 中设置：
+# tushare_token = "你的40位token"
 try:
-    TUSHARE_TOKEN = "14f338041757782cec740743e16402780823586b6426e1df2d71fb74"
-except KeyError:
+    TUSHARE_TOKEN = st.secrets["tushare_token"]
+except Exception:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
 
@@ -58,8 +60,8 @@ pro = ts.pro_api()
 tz = pytz.timezone("Asia/Shanghai")
 
 default_session_vars = {
-    "first_pick": None,          # 14:15 初次推荐
-    "final_pick": None,          # 14:45 最终推荐
+    "first_pick": None,
+    "final_pick": None,
     "first_locked": False,
     "final_locked": False,
     "today": datetime.now(tz).date(),
@@ -70,9 +72,9 @@ default_session_vars = {
     "hist_data_cache": {},
     "stock_industry_cache": {},
     "sector_strength_cache": {},
-    "candidate_df": pd.DataFrame(),   # 实时候选池
+    "candidate_df": pd.DataFrame(),
     "last_candidate_update": None,
-    "concept_top5": [],               # 存储概念板块 Top5（仅供展示）
+    "concept_top5": [],
 }
 
 for key, default in default_session_vars.items():
@@ -110,6 +112,7 @@ def get_top5_sectors(trade_date=None):
     """
     获取当天最强的 5 个行业板块（用于个股过滤）。
     同时尝试获取概念板块 Top5 用于展示。
+    注意：需要相应积分权限，否则返回默认行业列表。
     """
     if trade_date is None:
         trade_date = datetime.now(tz).strftime('%Y%m%d')
@@ -118,8 +121,7 @@ def get_top5_sectors(trade_date=None):
     if cache_key in st.session_state.sector_strength_cache:
         return st.session_state.sector_strength_cache[cache_key]
     
-    # 默认行业 Top5（降级方案）
-    default_top5 = []
+    default_top5 = ['银行', '证券', '保险', '酿酒', '医药']  # 降级默认
     concept_top5 = []
     
     # 1. 尝试获取概念板块（需要 8000 积分，仅展示）
@@ -131,30 +133,31 @@ def get_top5_sectors(trade_date=None):
             st.session_state.concept_top5 = concept_top5
             add_log("板块分析", f"最强概念板块 Top5: {', '.join(concept_top5)}")
     except Exception as e:
-        add_log("板块分析", f"limit_cpt_list 调用失败（积分不足或网络问题）: {str(e)[:50]}，降级使用行业涨幅排名")
+        add_log("板块分析", f"limit_cpt_list 调用失败: {str(e)[:50]}，降级使用行业涨幅排名")
     
     # 2. 获取行业涨幅排名（用于实际过滤）
     try:
-        # 获取当日所有股票行情（用于计算行业平均涨幅）
-        df = get_live_data(force_refresh=True)
+        # 优先使用实时数据计算行业涨幅
+        df = get_live_data(force_refresh=False)
         if df is not None and not df.empty and '所属行业' in df.columns:
             sector_stats = df.groupby('所属行业').agg({'涨跌幅': 'mean', '成交额': 'sum'}).reset_index()
             sector_stats = sector_stats.sort_values('涨跌幅', ascending=False)
             default_top5 = sector_stats['所属行业'].head(5).tolist()
         else:
-            # 如果没有实时数据，使用全量股票基础数据计算行业平均涨跌幅（备用）
-            df_basic = pro.daily_basic(trade_date=trade_date, fields='ts_code,turnover_rate')
-            if df_basic is not None and not df_basic.empty:
-                default_top5 = ['银行', '证券', '保险', '酿酒', '医药']
+            # 降级：使用全市场行业基础数据（取最活跃的几个行业）
+            df_industry = pro.stock_basic(fields='ts_code,industry')
+            if df_industry is not None and not df_industry.empty:
+                # 简单统计出现频率最高的行业
+                top_industries = df_industry['industry'].value_counts().head(5).index.tolist()
+                default_top5 = top_industries if top_industries else ['银行', '证券', '保险', '酿酒', '医药']
     except Exception as e:
         add_log("板块分析", f"行业涨幅计算失败: {str(e)[:50]}")
-        default_top5 = ['银行', '证券', '保险', '酿酒', '医药']
     
     st.session_state.sector_strength_cache[cache_key] = default_top5
     return default_top5
 
 # ===============================
-# 行业映射（用于个股行业字段）
+# 行业映射（用于个股行业字段，依赖 stock_basic 接口，需积分）
 # ===============================
 def batch_get_stock_industry(ts_codes):
     """批量获取行业信息，缓存"""
@@ -162,6 +165,7 @@ def batch_get_stock_industry(ts_codes):
     need = [c for c in ts_codes if c not in cache]
     if need:
         try:
+            # 注意：stock_basic 接口需要积分（2000分起）
             df = pro.stock_basic(fields='ts_code,industry')
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
@@ -169,7 +173,7 @@ def batch_get_stock_industry(ts_codes):
                     ind = row['industry'] if pd.notna(row['industry']) else '未知'
                     cache[code] = ind
         except Exception as e:
-            add_log("行业获取", f"批量失败: {str(e)[:50]}")
+            add_log("行业获取", f"批量失败: {str(e)[:50]}，将使用'未知'行业")
     return [cache.get(c, '未知') for c in ts_codes]
 
 def fetch_from_tushare():
@@ -179,12 +183,15 @@ def fetch_from_tushare():
         all_dfs = []
         for pattern in board_patterns:
             try:
+                # 注意：rt_k 接口需要付费权限（实时行情）
                 df_part = pro.rt_k(ts_code=pattern)
                 if df_part is not None and not df_part.empty:
                     all_dfs.append(df_part)
-            except Exception:
+            except Exception as e:
+                add_log("数据源", f"板块 {pattern} 异常: {str(e)[:50]}")
                 continue
         if not all_dfs:
+            add_log("数据源", "所有板块均无数据返回")
             return None
         df = pd.concat(all_dfs, ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code'])
@@ -210,6 +217,7 @@ def fetch_from_tushare():
         keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '最高价']
         keep_cols = [c for c in keep_cols if c in df.columns]
         df = df[keep_cols]
+        add_log("数据源", f"✅ 成功获取 {len(df)} 条主板数据")
         return df
     except Exception as e:
         add_log("数据源", f"异常: {str(e)[:100]}")
@@ -240,6 +248,7 @@ def get_historical_data(ts_code, limit=60):
     if ts_code in cache:
         return cache[ts_code]
     try:
+        # daily 接口需要基础积分（120分以上）
         end_date = datetime.now(tz).strftime('%Y%m%d')
         df = pro.daily(ts_code=ts_code, end_date=end_date, limit=limit)
         if df is not None and not df.empty:
@@ -247,11 +256,12 @@ def get_historical_data(ts_code, limit=60):
             cache[ts_code] = df
             return df
         return pd.DataFrame()
-    except Exception:
+    except Exception as e:
+        add_log("历史数据", f"{ts_code} 获取失败: {str(e)[:50]}")
         return pd.DataFrame()
 
 # ===============================
-# 战法核心筛选（全市场实时评分 + 板块过滤）
+# 战法核心筛选（全市场实时评分 + 板块过滤）- 逻辑不变
 # ===============================
 def score_stock(row, hist_df, strong_sectors):
     """计算单只股票的综合得分，返回得分和详细指标，若板块不在强板块中则返回None"""
@@ -296,7 +306,6 @@ def score_stock(row, hist_df, strong_sectors):
 
 def update_candidate_pool():
     """刷新候选池：获取最新数据，计算所有股票的得分，排序取前20"""
-    # 先获取最强板块 Top5（用于过滤）
     strong_sectors = get_top5_sectors()
     df = get_live_data(force_refresh=True)
     if df.empty:
@@ -377,7 +386,7 @@ if (st.session_state.last_candidate_update is None or
         add_log("系统", "候选池已更新")
 
 # 显示当前最强板块信息
-strong_sectors = get_top5_sectors()  # 从缓存或重新计算
+strong_sectors = get_top5_sectors()
 if strong_sectors:
     st.markdown(f"#### 🏆 今日最强行业板块 Top 5（用于个股过滤）: {', '.join(strong_sectors)}")
 else:
@@ -387,9 +396,7 @@ else:
 if st.session_state.concept_top5:
     st.markdown(f"#### 📌 参考：最强概念板块 Top 5（来自 limit_cpt_list，仅供观察）: {', '.join(st.session_state.concept_top5)}")
 
-# ============================================================
-# 核心改动：始终展示候选池，不再有时间窗口限制
-# ============================================================
+# 实时动态候选池
 st.markdown("### 📊 实时动态候选池（按综合得分排序，每60秒刷新）")
 if st.session_state.candidate_df.empty:
     st.warning("当前无符合战法条件的股票（可能不在最强板块内或技术条件不满足），请等待盘中出现信号。")
@@ -401,23 +408,20 @@ else:
     disp['综合得分'] = disp['综合得分'].apply(lambda x: f"{x:.3f}")
     st.dataframe(disp[['名称', '代码', '涨跌幅', '量比', '成交额', '所属行业', '综合得分']], use_container_width=True)
     
-    # 提示当前时间点与锁定阶段
+    # 阶段提示
     current_hour = now.hour
     current_minute = now.minute
     if current_hour == 14 and current_minute < 15:
-        st.info("⏳ 当前为观察阶段，候选池实时更新，14:15将自动锁定初次推荐")
+        st.info("⏳ 观察阶段，候选池实时更新，14:15将自动锁定初次推荐")
     elif current_hour == 14 and current_minute >= 15 and current_minute < 45:
         st.info("🔒 初次推荐已锁定，候选池仍在更新，14:45将自动锁定最终推荐")
     elif current_hour == 14 and current_minute >= 45:
         st.info("🎯 最终推荐已锁定，次日按计划操作")
 
-# ===============================
 # 时间控制与自动锁定
-# ===============================
 current_hour = now.hour
 current_minute = now.minute
 
-# 14:15 初次锁定
 if (current_hour == 14 and current_minute >= 15) and not st.session_state.first_locked:
     if not st.session_state.candidate_df.empty:
         best = st.session_state.candidate_df.iloc[0].to_dict()
@@ -434,7 +438,6 @@ if (current_hour == 14 and current_minute >= 15) and not st.session_state.first_
         add_log("自动锁定", f"14:15 初次推荐: {best['名称']}")
         st.rerun()
 
-# 14:45 最终锁定（覆盖初次推荐）
 if (current_hour == 14 and current_minute >= 45) and not st.session_state.final_locked:
     if not st.session_state.candidate_df.empty:
         best = st.session_state.candidate_df.iloc[0].to_dict()
@@ -451,9 +454,7 @@ if (current_hour == 14 and current_minute >= 45) and not st.session_state.final_
         add_log("自动锁定", f"14:45 最终推荐: {best['名称']}")
         st.rerun()
 
-# ===============================
 # 显示推荐结果
-# ===============================
 st.markdown("---")
 col1, col2 = st.columns(2)
 with col1:
@@ -501,7 +502,7 @@ with col2:
         else:
             st.info("等待 14:45 自动锁定最终推荐...")
 
-# 额外：如果候选池非空且最终推荐尚未锁定，提供手动选择功能
+# 手动选择（最终推荐锁定前）
 if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
     st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
     manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
@@ -522,9 +523,7 @@ if not st.session_state.candidate_df.empty and not st.session_state.final_locked
         add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
         st.rerun()
 
-# ===============================
 # 系统日志
-# ===============================
 with st.expander("📜 系统日志", expanded=False):
     if st.session_state.logs:
         for log in reversed(st.session_state.logs[-10:]):
@@ -532,9 +531,7 @@ with st.expander("📜 系统日志", expanded=False):
     else:
         st.info("暂无日志记录")
 
-# ===============================
 # 自动刷新（交易时段每60秒刷新一次）
-# ===============================
 if is_trading:
     st.write("⏳ 60秒后自动刷新数据...")
     time.sleep(60)
