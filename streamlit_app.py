@@ -44,7 +44,7 @@ st.set_page_config(page_title="全天候动态选股 · 最强板块尾盘战法
 # 🔑 Tushare Token（从 secrets 读取）
 # ===============================
 try:
-    TUSHARE_TOKEN = "dea49fc606a0945a8d00408b7828e4b6c7fcb3172a750fdeba734add"
+    TUSHARE_TOKEN = "14f338041757782cec740743e16402780823586b6426e1df2d71fb74"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
