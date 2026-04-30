@@ -33,7 +33,7 @@ st.set_page_config(page_title="尾盘博弈 6.3 · 主线题材+硬性技术", l
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "dea49fc606a0945a8d00408b7828e4b6c7fcb3172a750fdeba734add"
+    TUSHARE_TOKEN = "3cc067cf223333d2e817be127a633d440f12de98e12c731905f38392"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
