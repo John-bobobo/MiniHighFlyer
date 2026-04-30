@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 主线题材+硬性技术条件（性能优化版）
+尾盘博弈 6.3 · 主线题材+硬性技术条件（参数可调版）
 ===================================================
-✅ 优化：限制硬性检查股票数量（最多200只），避免超时
-✅ 新增进度条和状态提示
-✅ 保留：主线板块 Top5 过滤 + 四项硬性技术条件
-✅ 原有多因子评分、收敛记录、自动推荐功能不变
-✅ 修复 candidate_df 未赋值导致的 AttributeError
+✅ 硬性条件可调：涨幅、量比、三连阳、5日线、近5日阳线
+✅ 侧边栏提供滑块和复选框，实时调整
+✅ 主线板块过滤 + 多因子评分
+✅ 性能优化：最多检查200只股票，避免超时
 """
 import sys
 import streamlit as st
@@ -28,7 +27,7 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 主线题材+硬性技术", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 硬性条件可调", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token
@@ -71,8 +70,8 @@ default_session_vars = {
     "stock_industry_cache": {},
     "convergence_records": [],
     "backup_picks": [],
-    "candidate_df": pd.DataFrame(),  # 候选池
-    "final_locked": False,          # 最终锁定标志
+    "candidate_df": pd.DataFrame(),
+    "final_locked": False,
 }
 
 for key, default in default_session_vars.items():
@@ -104,7 +103,7 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
-# 个股行业信息获取（缓存 + 批量）
+# 个股行业信息获取
 # ===============================
 def batch_get_stock_industry(ts_codes):
     cache = st.session_state.stock_industry_cache
@@ -125,7 +124,7 @@ def batch_get_stock_industry(ts_codes):
     return [cache.get(c, '未知') for c in ts_codes]
 
 # ===============================
-# Tushare 数据获取（增强行业填充）
+# 数据获取
 # ===============================
 def fetch_from_tushare():
     try:
@@ -231,38 +230,52 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 硬性技术条件检查（快速版）
+# 硬性技术条件检查（参数从session_state读取）
 # ===============================
 def check_hard_conditions_fast(row, hist_df):
     if hist_df.empty or len(hist_df) < 6:
         return False, "历史数据不足"
-    # 1. 涨幅 2%-6.5%
+    
+    # 读取用户设定的阈值
+    min_pct = st.session_state.get('min_pct', 2.0)
+    max_pct = st.session_state.get('max_pct', 6.5)
+    min_vr = st.session_state.get('min_vr', 1.2)
+    max_vr = st.session_state.get('max_vr', 1.8)
+    enable_3up = st.session_state.get('enable_3up', True)
+    enable_ma5 = st.session_state.get('enable_ma5', True)
+    enable_strong_day = st.session_state.get('enable_strong_day', True)
+    
     pct = row['涨跌幅']
-    if pct < 2.0 or pct > 6.5:
-        return False, f"涨幅 {pct:.2f}% 超出范围"
-    # 2. 量比 1.2-1.8
+    if pct < min_pct or pct > max_pct:
+        return False, f"涨幅 {pct:.2f}% 超出 [{min_pct},{max_pct}]"
+    
     avg_vol_5 = hist_df['vol'].tail(5).mean()
     if avg_vol_5 == 0:
         return False, "前5日均量为0"
     vol_ratio = row['成交量'] / avg_vol_5
-    if vol_ratio < 1.2 or vol_ratio > 1.8:
-        return False, f"量比 {vol_ratio:.2f} 超出范围"
-    # 3. 三连阳 + 站上5日线
+    if vol_ratio < min_vr or vol_ratio > max_vr:
+        return False, f"量比 {vol_ratio:.2f} 超出 [{min_vr},{max_vr}]"
+    
     recent_3 = hist_df['close'].tail(3).values
-    if len(recent_3) < 3 or not (recent_3[0] < recent_3[1] < recent_3[2]):
-        return False, "非三连阳"
-    ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
-    if ma5 is None or np.isnan(ma5) or row['最新价'] < ma5:
-        return False, "未站上5日线"
-    # 4. 近5日有放量阳线
-    hist_5 = hist_df.tail(5)
-    has_strong_day = ((hist_5['close'] - hist_5['open']) > 0).any()
-    if not has_strong_day:
-        return False, "近5日无放量阳线"
+    if enable_3up:
+        if len(recent_3) < 3 or not (recent_3[0] < recent_3[1] < recent_3[2]):
+            return False, "非三连阳"
+    
+    if enable_ma5:
+        ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
+        if ma5 is None or np.isnan(ma5) or row['最新价'] < ma5:
+            return False, "未站上5日线"
+    
+    if enable_strong_day:
+        hist_5 = hist_df.tail(5)
+        has_strong_day = ((hist_5['close'] - hist_5['open']) > 0).any()
+        if not has_strong_day:
+            return False, "近5日无阳线"
+    
     return True, "符合"
 
 # ===============================
-# 原有因子计算函数
+# 原有因子计算函数（不变）
 # ===============================
 def filter_stocks_by_rule(df):
     if df.empty:
@@ -271,7 +284,7 @@ def filter_stocks_by_rule(df):
     if '名称' in filtered.columns:
         filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
     if '涨跌幅' in filtered.columns:
-        filtered = filtered[filtered['涨跌幅'] <= 6.5]
+        filtered = filtered[filtered['涨跌幅'] <= 6.5]  # 上限保留，下限由硬性条件处理
     if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
         filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
     if not filtered.empty and '成交额' in filtered.columns:
@@ -463,7 +476,7 @@ def get_final_recommendation_from_convergence():
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 主线题材+硬性技术条件（性能优化版）")
+st.title("🔥 尾盘博弈 6.3 · 硬性条件可调版")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -480,10 +493,10 @@ if st.session_state.today != now.date():
     st.session_state.backup_picks = []
     st.session_state.candidate_df = pd.DataFrame()
     st.session_state.final_locked = False
-    add_log("系统", "新交易日开始，已清空历史数据")
+    add_log("系统", "新交易日开始，重置所有状态")
     st.rerun()
 
-# 侧边栏
+# 侧边栏（包含硬性条件调节）
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
@@ -551,9 +564,20 @@ with st.sidebar:
         '量比': w_vol_ratio,
         '波动率': w_volatility
     }
+    
     st.markdown("---")
-    st.info("📌 硬性技术条件已启用：涨幅2%-6.5% | 量比1.2-1.8 | 三连阳+站上5日线 | 近5日放量阳线")
-    st.info("⚡ 性能优化：最多详细检查200只潜力股，避免超时")
+    st.markdown("#### 🎚️ 硬性条件阈值调节（放宽可增加选股）")
+    min_pct = st.slider("最小涨幅 (%)", 0.0, 5.0, 2.0, 0.5, key="min_pct")
+    max_pct = st.slider("最大涨幅 (%)", 3.0, 10.0, 6.5, 0.5, key="max_pct")
+    min_vr = st.slider("最小量比", 0.5, 2.0, 1.2, 0.1, key="min_vr")
+    max_vr = st.slider("最大量比", 1.2, 3.0, 1.8, 0.1, key="max_vr")
+    enable_3up = st.checkbox("要求三连阳", value=True, key="enable_3up")
+    enable_ma5 = st.checkbox("要求站上5日线", value=True, key="enable_ma5")
+    enable_strong_day = st.checkbox("要求近5日有阳线", value=True, key="enable_strong_day")
+    st.caption("💡 提示：取消勾选可关闭对应条件，大幅放宽；调整滑块可扩大范围")
+
+    st.markdown("---")
+    st.info("📌 当前硬性条件已应用于选股，如需更多信号请适当放宽")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -657,7 +681,7 @@ else:
     top5_sectors = sector_analysis.head(5).index.tolist()
     st.success(f"🏆 今日最强主线板块 Top5: {', '.join(top5_sectors)}")
 
-st.markdown("### 🎯 多因子智能选股引擎（硬性条件+主线板块）")
+st.markdown("### 🎯 多因子智能选股引擎（硬性条件可调）")
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
     top_candidate = None
@@ -703,7 +727,7 @@ else:
         st.caption(f"硬性技术条件过滤后股票数: {len(hard_df)}")
         
         if hard_df.empty:
-            st.warning("当前无满足所有硬性条件的股票，请等待或适当放宽参数。")
+            st.warning("当前无满足所有硬性条件的股票，请尝试**放宽侧边栏的参数**（降低涨幅下限、扩大量比范围、或取消某些条件）。")
             top_candidate = None
             st.session_state.candidate_df = pd.DataFrame()
         else:
@@ -725,7 +749,6 @@ else:
             top_candidates = scored_df.head(10)
             top_candidate = scored_df.iloc[0] if not scored_df.empty else None
             
-            # 保存到 session_state 供手动选择使用
             st.session_state.candidate_df = top_candidates.copy() if not top_candidates.empty else pd.DataFrame()
             
             st.markdown("#### 📈 优选股票因子分析")
@@ -814,7 +837,7 @@ else:
             }
 
 # ===============================
-# 自动推荐（首次推荐 13:30-14:00）
+# 自动推荐
 # ===============================
 st.markdown("### 🤖 自动推荐系统")
 use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
@@ -927,9 +950,7 @@ with col_rec2:
         else:
             st.info("⏰ 最终锁定时段: 14:40后")
 
-# ===============================
-# 手动选择（最终推荐锁定前）
-# ===============================
+# 手动选择
 if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
     st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
     manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
@@ -949,9 +970,7 @@ if not st.session_state.candidate_df.empty and not st.session_state.final_locked
         add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
         st.rerun()
 
-# ===============================
 # 系统日志
-# ===============================
 with st.expander("📜 系统日志", expanded=False):
     if st.session_state.logs:
         for log in reversed(st.session_state.logs[-10:]):
@@ -966,9 +985,7 @@ with st.expander("📜 系统日志", expanded=False):
     else:
         st.info("暂无日志记录")
 
-# ===============================
 # 自动刷新
-# ===============================
 if is_trading:
     refresh_time = 30
     st.write(f"⏳ {refresh_time}秒后自动刷新数据...")
