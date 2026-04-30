@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · Tushare 专用版（主线题材增强 + 硬性技术条件）
+尾盘博弈 6.3 · 主线题材+硬性技术条件（性能优化版）
 ===================================================
-✅ 数据源：仅 Tushare rt_k 接口
-✅ 新增：硬性技术条件过滤（涨幅/量比/三连阳/5日线/放量阳线）
-✅ 新增：真实行业数据填充，只选最强板块 Top5 个股
-✅ 保留原有多因子评分、收敛记录、自动推荐等全部功能
+✅ 优化：限制硬性检查股票数量（最多200只），避免超时
+✅ 新增进度条和状态提示
+✅ 保留：主线板块 Top5 过滤 + 四项硬性技术条件
+✅ 原有多因子评分、收敛记录、自动推荐功能不变
 """
 import sys
 import streamlit as st
@@ -228,45 +228,37 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 硬性技术条件检查（新增）
+# 硬性技术条件检查（快速版，直接复用 hist_df）
 # ===============================
-def check_hard_conditions(row, hist_df):
+def check_hard_conditions_fast(row, hist_df):
     """
-    检查是否满足技术硬性条件：
-    1. 涨幅 2% - 6.5%
-    2. 量比 1.2 - 1.8 (当日成交量 / 前5日均量)
-    3. 日线三连阳 + 收盘站稳5日均线
-    4. 近5日有放量阳线（收盘 > 开盘）
+    检查四项硬性条件，返回 (是否通过, 原因)
     """
-    # 条件1: 涨幅范围
-    pct = row['涨跌幅']
-    if pct < 2.0 or pct > 6.5:
-        return False, "涨幅不符"
-    
-    # 条件2: 量比
     if hist_df.empty or len(hist_df) < 6:
         return False, "历史数据不足"
+    # 1. 涨幅 2%-6.5%
+    pct = row['涨跌幅']
+    if pct < 2.0 or pct > 6.5:
+        return False, f"涨幅 {pct:.2f}% 超出范围"
+    # 2. 量比 1.2-1.8
     avg_vol_5 = hist_df['vol'].tail(5).mean()
     if avg_vol_5 == 0:
         return False, "前5日均量为0"
     vol_ratio = row['成交量'] / avg_vol_5
     if vol_ratio < 1.2 or vol_ratio > 1.8:
-        return False, "量比不符"
-    
-    # 条件3: 日线三连阳 + 收盘站稳5日均线
+        return False, f"量比 {vol_ratio:.2f} 超出范围"
+    # 3. 三连阳 + 站上5日线
     recent_3 = hist_df['close'].tail(3).values
     if len(recent_3) < 3 or not (recent_3[0] < recent_3[1] < recent_3[2]):
         return False, "非三连阳"
     ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
     if ma5 is None or np.isnan(ma5) or row['最新价'] < ma5:
         return False, "未站上5日线"
-    
-    # 条件4: 近5日有放量阳线（收盘>开盘）
+    # 4. 近5日有放量阳线
     hist_5 = hist_df.tail(5)
     has_strong_day = ((hist_5['close'] - hist_5['open']) > 0).any()
     if not has_strong_day:
         return False, "近5日无放量阳线"
-    
     return True, "符合"
 
 # ===============================
@@ -279,7 +271,7 @@ def filter_stocks_by_rule(df):
     if '名称' in filtered.columns:
         filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
     if '涨跌幅' in filtered.columns:
-        filtered = filtered[filtered['涨跌幅'] <= 6.5]  # 涨幅上限保留，下限由硬性条件处理
+        filtered = filtered[filtered['涨跌幅'] <= 6.5]  # 上限保留
     if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
         filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
     if not filtered.empty and '成交额' in filtered.columns:
@@ -468,10 +460,10 @@ def get_final_recommendation_from_convergence():
     return first, backups
 
 # ===============================
-# 主程序开始
+# 主程序布局及逻辑
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 主线题材+硬性技术条件")
+st.title("🔥 尾盘博弈 6.3 · 主线题材+硬性技术条件（性能优化版）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -489,7 +481,7 @@ if st.session_state.today != now.date():
     add_log("系统", "新交易日开始，已清空历史数据")
     st.rerun()
 
-# 侧边栏（保持原样，省略部分代码以节省篇幅，实际使用需保留完整）
+# 侧边栏
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
@@ -558,6 +550,7 @@ with st.sidebar:
     }
     st.markdown("---")
     st.info("📌 硬性技术条件已启用：涨幅2%-6.5% | 量比1.2-1.8 | 三连阳+站上5日线 | 近5日放量阳线")
+    st.info("⚡ 性能优化：最多详细检查200只潜力股，避免超时")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -607,8 +600,42 @@ st.markdown("### 📊 数据获取状态")
 try:
     with st.spinner("正在获取实时数据..."):
         df = get_stable_realtime_data()
-    # ... 省略数据源状态显示（保持原样）
-    # 为节省篇幅，此处略去，实际上需保留原样
+
+    data_source_status = {
+        "real_data": ("✅", "Tushare rt_k 实时行情", "#e6f7ff"),
+        "cached_real_data": ("🔄", "缓存真实数据", "#fff7e6"),
+        "non_trading": ("⏸️", "非交易时间（无实时）", "#f0f0f0"),
+        "unknown": ("⚪", "等待获取数据", "#f0f0f0"),
+        "failed": ("🔴", "数据获取失败", "#ffe6e6")
+    }
+    status_emoji, status_text, bg_color = data_source_status.get(
+        st.session_state.data_source, data_source_status["unknown"]
+    )
+    st.markdown(f"""
+    <div style="background-color: {bg_color}; padding: 10px 15px; border-radius: 5px; border-left: 4px solid #1890ff; margin: 10px 0;">
+        <strong>{status_emoji} 数据源状态:</strong> {status_text}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not df.empty:
+        st.success(f"✅ 成功获取 {len(df)} 条真实股票数据（已填充行业）")
+        with st.expander("🔍 查看数据样本"):
+            display_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+            display_cols = [c for c in display_cols if c in df.columns]
+            st.dataframe(df[display_cols].head(10))
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+            with col_stat1:
+                st.metric("平均涨幅", f"{df['涨跌幅'].mean():.2f}%")
+            with col_stat2:
+                st.metric("最高涨幅", f"{df['涨跌幅'].max():.2f}%")
+            with col_stat3:
+                if '成交额' in df.columns:
+                    st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
+    else:
+        if st.session_state.data_source == "non_trading":
+            st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
+        else:
+            st.warning("⚠️ 获取到的数据为空，可能原因：Tushare 权限不足、token错误或接口异常")
 except Exception as e:
     st.error(f"❌ 数据获取失败: {str(e)}")
     df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
@@ -617,9 +644,8 @@ except Exception as e:
 st.markdown("### 📊 板块热度分析（主线题材）")
 if df.empty or '所属行业' not in df.columns:
     st.info("当前无有效板块数据，跳过板块分析。")
-    strongest_sector = None
+    top5_sectors = []
 else:
-    # 计算板块强度（基于行业平均涨幅）
     sector_analysis = df.groupby('所属行业').agg({'涨跌幅': 'mean', '成交额': 'sum', '代码': 'count'})
     sector_analysis = sector_analysis.rename(columns={'代码': '股票数量'})
     sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
@@ -629,16 +655,16 @@ else:
     sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
     top5_sectors = sector_analysis.head(5).index.tolist()
     st.success(f"🏆 今日最强主线板块 Top5: {', '.join(top5_sectors)}")
-    st.info("⚠️ 选股将同时满足：主线板块 + 涨幅2%-6.5% + 量比1.2-1.8 + 三连阳+站上5日线 + 近5日放量阳线")
 
-# 选股流程
 st.markdown("### 🎯 多因子智能选股引擎（硬性条件+主线板块）")
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
     top_candidate = None
 else:
-    # 基础过滤（ST、炸板、成交额）
+    # 基础过滤（ST、炸板、成交额过低）
     filtered = filter_stocks_by_rule(df)
+    st.caption(f"基础过滤后股票数: {len(filtered)}")
+    
     # 主线板块过滤
     if not top5_sectors:
         sector_filtered = filtered
@@ -647,114 +673,307 @@ else:
         sector_filtered = filtered[filtered['所属行业'].isin(top5_sectors)]
         st.caption(f"主线板块过滤后股票数: {len(sector_filtered)}")
     
-    # 对剩余股票进行硬性技术条件筛选
-    candidates_hard = []
-    for idx, row in sector_filtered.iterrows():
-        hist = get_historical_data(row['代码'])
-        if hist.empty:
-            continue
-        ok, reason = check_hard_conditions(row, hist)
-        if ok:
-            candidates_hard.append(row)
-        else:
-            add_log("硬性过滤", f"{row['名称']} 不符合: {reason}")
-    hard_df = pd.DataFrame(candidates_hard) if candidates_hard else pd.DataFrame()
-    st.caption(f"硬性技术条件过滤后股票数: {len(hard_df)}")
-    
-    if hard_df.empty:
-        st.warning("当前无满足所有硬性条件的股票（可能市场机会较少），请等待或放宽参数。")
+    if sector_filtered.empty:
+        st.warning("主线板块内无股票，无法进行选股。")
         top_candidate = None
     else:
-        # 添加技术指标（用于多因子评分）
-        df_with_tech = add_technical_indicators(hard_df, top_n=200)
-        # 填充缺失因子
-        if '5日动量' not in df_with_tech.columns:
-            df_with_tech['5日动量'] = df_with_tech['涨跌幅']
-        if '20日反转' not in df_with_tech.columns:
-            df_with_tech['20日反转'] = -df_with_tech['涨跌幅'] * 0.3
-        if '量比' not in df_with_tech.columns:
-            if 'vol_ratio_real' in df_with_tech.columns:
-                df_with_tech['量比'] = df_with_tech['vol_ratio_real']
-            else:
-                df_with_tech['量比'] = 1.0
-        if '波动率' not in df_with_tech.columns:
-            df_with_tech['波动率'] = df_with_tech['涨跌幅'].abs()
+        # 限制只能检查的股票数量（最多200只），优先选涨幅+成交额靠前的
+        MAX_CHECK = 200
+        tmp = sector_filtered.copy()
+        tmp['_pre_score'] = (tmp['涨跌幅'].rank(pct=True) + tmp['成交额'].rank(pct=True)) / 2
+        tmp = tmp.sort_values('_pre_score', ascending=False)
+        to_check = tmp.head(MAX_CHECK)
+        st.caption(f"将对前 {len(to_check)} 只潜力股进行硬性技术条件检查...")
         
-        sector_avg = df_with_tech['涨跌幅'].mean() if '涨跌幅' in df_with_tech.columns else 0
-        scored_df = calculate_composite_score(df_with_tech, sector_avg, factor_weights, strongest_sector=None)
-        top_candidates = scored_df.head(10)
-        top_candidate = scored_df.iloc[0] if not scored_df.empty else None
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        candidates_hard = []
+        for i, (idx, row) in enumerate(to_check.iterrows()):
+            status_text.text(f"正在检查 {i+1}/{len(to_check)}: {row['名称']}")
+            hist = get_historical_data(row['代码'])
+            if hist.empty:
+                progress_bar.progress((i+1)/len(to_check))
+                continue
+            ok, reason = check_hard_conditions_fast(row, hist)
+            if ok:
+                candidates_hard.append(row)
+            # 可选：记录未通过原因（去注释可调试）
+            # else:
+            #     add_log("硬性过滤", f"{row['名称']} 不符合: {reason}")
+            progress_bar.progress((i+1)/len(to_check))
+        progress_bar.empty()
+        status_text.empty()
         
-        # 展示优选股票分析（与原界面类似，此处简略）
-        st.markdown("#### 📈 优选股票因子分析")
-        if top_candidate is not None:
-            # 展示选中股票信息
-            col_info, col_factors = st.columns([1, 2])
-            with col_info:
-                st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
-                st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
-                st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.3f}")
-                st.metric("**今日涨幅**", f"{top_candidate.get('涨跌幅', 0):.2f}%")
-            # 候选列表展示
+        hard_df = pd.DataFrame(candidates_hard) if candidates_hard else pd.DataFrame()
+        st.caption(f"硬性技术条件过滤后股票数: {len(hard_df)}")
+        
+        if hard_df.empty:
+            st.warning("当前无满足所有硬性条件的股票，请等待或适当放宽参数。")
+            top_candidate = None
+        else:
+            # 添加技术指标用于多因子评分
+            df_with_tech = add_technical_indicators(hard_df, top_n=200)
+            # 填充可能缺失的因子
+            if '5日动量' not in df_with_tech.columns:
+                df_with_tech['5日动量'] = df_with_tech['涨跌幅']
+            if '20日反转' not in df_with_tech.columns:
+                df_with_tech['20日反转'] = -df_with_tech['涨跌幅'] * 0.3
+            if '量比' not in df_with_tech.columns:
+                if 'vol_ratio_real' in df_with_tech.columns:
+                    df_with_tech['量比'] = df_with_tech['vol_ratio_real']
+                else:
+                    df_with_tech['量比'] = 1.0
+            if '波动率' not in df_with_tech.columns:
+                df_with_tech['波动率'] = df_with_tech['涨跌幅'].abs()
+            
+            sector_avg = df_with_tech['涨跌幅'].mean() if '涨跌幅' in df_with_tech.columns else 0
+            scored_df = calculate_composite_score(df_with_tech, sector_avg, factor_weights, strongest_sector=None)
+            top_candidates = scored_df.head(10)
+            top_candidate = scored_df.iloc[0] if not scored_df.empty else None
+            
+            st.markdown("#### 📈 优选股票因子分析")
+            if top_candidate is not None:
+                col_info, col_factors = st.columns([1, 2])
+                with col_info:
+                    st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
+                    st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
+                    st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.3f}")
+                    st.metric("**风险调整得分**", f"{top_candidate.get('风险调整得分', 0):.3f}")
+                    if '涨跌幅' in top_candidate:
+                        st.metric("**今日涨幅**", f"{top_candidate['涨跌幅']:.2f}%")
+                with col_factors:
+                    # 简单显示因子得分雷达图数据
+                    factor_names = ['涨跌幅', '成交额', '5日动量', '20日反转', '量比', '波动率']
+                    factor_values = []
+                    for name in factor_names:
+                        if name in top_candidate:
+                            col_min = scored_df[name].min()
+                            col_max = scored_df[name].max()
+                            if col_max > col_min:
+                                norm_value = (top_candidate[name] - col_min) / (col_max - col_min) * 100
+                            else:
+                                norm_value = 50
+                            factor_values.append(norm_value)
+                    if factor_values:
+                        factor_df = pd.DataFrame({'因子': factor_names[:len(factor_values)], '得分': factor_values})
+                        st.bar_chart(factor_df.set_index('因子'))
+                        with st.expander("查看因子权重"):
+                            for name, weight in factor_weights.items():
+                                if weight != 0:
+                                    st.write(f"- **{name}**: {weight:.3f}")
+            
             st.markdown("#### 🏆 候选股票排名 (前5)")
             if not top_candidates.empty:
-                display_df = top_candidates[['名称', '代码', '涨跌幅', '成交额', '综合得分']].head().copy()
-                display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
-                display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
-                display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.3f}")
-                st.dataframe(display_df, use_container_width=True)
-        
-        # 收敛记录与自动锁定（与原有逻辑相同，此处保留）
-        if current_hour == 14 and current_minute < 40:
-            update_convergence(top_candidates, current_time)
-        if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
-            final_rec, backups = get_final_recommendation_from_convergence()
-            if final_rec:
-                stock_info = scored_df[scored_df['代码'] == final_rec['代码']].iloc[0].to_dict()
-                st.session_state.final_pick = {
-                    'name': stock_info.get('名称', final_rec['名称']),
-                    'code': final_rec['代码'],
-                    '涨跌幅': float(stock_info.get('涨跌幅', 0)),
-                    '成交额': float(stock_info.get('成交额', 0)),
-                    'time': current_time_str,
-                    'auto': True,
-                    'risk_adjusted_score': float(stock_info.get('风险调整得分', 0)),
-                    'composite_score': float(stock_info.get('综合得分', 0)),
-                    'sector': ', '.join(top5_sectors),
-                    'data_source': st.session_state.data_source
-                }
-                st.session_state.locked = True
-                st.session_state.backup_picks = []
-                for b in backups:
-                    b_info = scored_df[scored_df['代码'] == b['代码']].iloc[0].to_dict()
-                    st.session_state.backup_picks.append({
-                        'name': b_info.get('名称', b['名称']),
-                        'code': b['代码'],
-                        '涨跌幅': float(b_info.get('涨跌幅', 0)),
-                    })
-                add_log("自动推荐", f"收敛锁定最终推荐: {final_rec['名称']}")
-                st.rerun()
-        
-        # 保存测试用推荐
-        st.session_state.test_top_stock = {
+                display_cols = ['名称', '代码', '涨跌幅', '成交额', '综合得分', '风险调整得分']
+                display_cols = [c for c in display_cols if c in top_candidates.columns]
+                display_top5 = top_candidates[display_cols].head().copy()
+                display_top5['涨跌幅'] = display_top5['涨跌幅'].apply(lambda x: f"{x:.2f}%")
+                display_top5['成交额'] = display_top5['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
+                display_top5['综合得分'] = display_top5['综合得分'].apply(lambda x: f"{x:.3f}")
+                if '风险调整得分' in display_top5.columns:
+                    display_top5['风险调整得分'] = display_top5['风险调整得分'].apply(lambda x: f"{x:.3f}")
+                st.dataframe(display_top5, use_container_width=True)
+            
+            # 收敛记录
+            if current_hour == 14 and current_minute < 40:
+                update_convergence(top_candidates, current_time)
+            
+            # 14:40 自动锁定最终推荐
+            if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
+                final_rec, backups = get_final_recommendation_from_convergence()
+                if final_rec:
+                    stock_info = scored_df[scored_df['代码'] == final_rec['代码']].iloc[0].to_dict()
+                    st.session_state.final_pick = {
+                        'name': stock_info.get('名称', final_rec['名称']),
+                        'code': final_rec['代码'],
+                        '涨跌幅': float(stock_info.get('涨跌幅', 0)),
+                        '成交额': float(stock_info.get('成交额', 0)),
+                        'time': current_time_str,
+                        'auto': True,
+                        'risk_adjusted_score': float(stock_info.get('风险调整得分', 0)),
+                        'composite_score': float(stock_info.get('综合得分', 0)),
+                        'sector': ', '.join(top5_sectors),
+                        'data_source': st.session_state.data_source
+                    }
+                    st.session_state.locked = True
+                    st.session_state.backup_picks = []
+                    for b in backups:
+                        b_info = scored_df[scored_df['代码'] == b['代码']].iloc[0].to_dict()
+                        st.session_state.backup_picks.append({
+                            'name': b_info.get('名称', b['名称']),
+                            'code': b['代码'],
+                            '涨跌幅': float(b_info.get('涨跌幅', 0)),
+                        })
+                    add_log("自动推荐", f"收敛锁定最终推荐: {final_rec['名称']}")
+                    st.rerun()
+            
+            # 保存测试用推荐
+            st.session_state.test_top_stock = {
+                'name': top_candidate.get('名称', ''),
+                'code': top_candidate.get('代码', ''),
+                '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
+                '成交额': float(top_candidate.get('成交额', 0)),
+                '综合得分': float(top_candidate.get('综合得分', 0)),
+                'risk_adjusted_score': float(top_candidate.get('风险调整得分', 0)),
+                'time': current_time_str,
+                'sector': ', '.join(top5_sectors) if top5_sectors else '全市场',
+                'data_source': st.session_state.data_source
+            }
+
+# ===============================
+# 自动推荐（首次推荐 13:30-14:00）
+# ===============================
+st.markdown("### 🤖 自动推荐系统")
+use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
+if not use_real_data:
+    st.info("⏸️ 当前非交易时间或无实时数据，自动推荐已暂停")
+else:
+    if is_first_rec_time and st.session_state.morning_pick is None and top_candidate is not None:
+        st.session_state.morning_pick = {
             'name': top_candidate.get('名称', ''),
             'code': top_candidate.get('代码', ''),
             '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
             '成交额': float(top_candidate.get('成交额', 0)),
-            '综合得分': float(top_candidate.get('综合得分', 0)),
-            'risk_adjusted_score': float(top_candidate.get('风险调整得分', 0)),
             'time': current_time_str,
-            'sector': ', '.join(top5_sectors) if top5_sectors else '全市场',
+            'auto': True,
+            'risk_adjusted_score': float(top_candidate.get('风险调整得分', 0)),
+            'composite_score': float(top_candidate.get('综合得分', 0)),
+            'sector': top_candidate.get('所属行业', '主线板块'),
             'data_source': st.session_state.data_source
         }
+        add_log("自动推荐", f"生成首次推荐: {top_candidate.get('名称', '')}")
+        st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
+        st.rerun()
 
-# 自动推荐与显示区域（保持原样，因篇幅从略，实际代码中需完整保留）
-# ... 省略 ...
+# ===============================
+# 推荐显示区域
+# ===============================
+st.markdown("---")
+st.markdown("### 📋 推荐结果")
+col_rec1, col_rec2 = st.columns(2)
+with col_rec1:
+    st.subheader("🕐 首次推荐 (13:30-14:00)")
+    if st.session_state.morning_pick is not None:
+        pick = st.session_state.morning_pick
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
+        st.markdown(f"""
+        <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
+            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            <p><strong>📅 推荐时间:</strong> {pick['time']}</p>
+            <p><strong>📈 当前涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
+            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
+            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('composite_score', 'N/A'):.3f}</p>
+            <p><strong>⚖️ 风险调整得分:</strong> {pick.get('risk_adjusted_score', 'N/A'):.3f}</p>
+            <p><strong>🔧 来源:</strong> {'自动生成' if pick.get('auto', False) else '手动设置'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        if pick['涨跌幅'] > 6:
+            st.warning("📝 **操作建议**: 涨幅较大，建议观望或轻仓参与")
+        elif pick.get('涨跌幅', 0) < 0:
+            st.info("📝 **操作建议**: 当前下跌，观察是否有反弹机会")
+        else:
+            st.success("📝 **操作建议**: 可考虑逢低关注")
+    else:
+        if is_first_rec_time:
+            if use_real_data and top_candidate is not None:
+                st.info("⏳ 正在自动生成首次推荐...")
+            else:
+                st.info("⏸️ 等待真实数据或合适标的")
+        else:
+            st.info("⏰ 首次推荐时段: 13:30-14:00")
+
+with col_rec2:
+    st.subheader("🎯 最终锁定 (14:40后)")
+    if st.session_state.final_pick is not None:
+        pick = st.session_state.final_pick
+        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
+        st.markdown(f"""
+        <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
+            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            <p><strong>📅 锁定时间:</strong> {pick['time']}</p>
+            <p><strong>📈 锁定涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
+            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
+            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('composite_score', 'N/A'):.3f}</p>
+            <p><strong>⚖️ 风险调整得分:</strong> {pick.get('risk_adjusted_score', 'N/A'):.3f}</p>
+            <p><strong>🔒 状态:</strong> {'已锁定' if st.session_state.locked else '未锁定'}</p>
+            <p><strong>🔧 来源:</strong> {'自动锁定' if pick.get('auto', False) else '手动设置'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.session_state.backup_picks:
+            st.markdown("#### 🥈 备选推荐")
+            for i, b in enumerate(st.session_state.backup_picks, 1):
+                st.write(f"{i}. {b['name']} ({b['code']}) 涨幅 {b['涨跌幅']:.2f}%")
+        st.markdown("#### 📋 明日操作计划")
+        if pick['涨跌幅'] < 0:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "10-20%", "低仓位")
+            with col_b:
+                st.metric("止损位", "-3%", "严格止损")
+        elif pick['涨跌幅'] < 3:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "20-30%", "适中仓位")
+            with col_b:
+                st.metric("止损位", "-2%", "正常止损")
+        else:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("建议仓位", "15-25%", "谨慎参与")
+            with col_b:
+                st.metric("止损位", "-2.5%", "适度止损")
+        st.info("💡 **提示**: 建议次日开盘观察10-30分钟再决定是否介入")
+    else:
+        if is_final_lock_time:
+            if use_real_data and top_candidate is not None:
+                st.info("⏳ 正在收敛计算最终推荐...")
+            else:
+                st.info("⏸️ 等待真实数据或合适标的")
+        else:
+            st.info("⏰ 最终锁定时段: 14:40后")
+
+# 手动选择（最终推荐锁定前）
+if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
+    st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
+    manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
+    selected = st.selectbox("从候选池中手动选择一只股票:", list(manual_options.keys()))
+    if st.button("✅ 设为首选（覆盖最终推荐）"):
+        idx = manual_options[selected]
+        row = st.session_state.candidate_df.iloc[idx]
+        st.session_state.final_pick = {
+            'name': row['名称'],
+            'code': row['代码'],
+            '涨跌幅': row['涨跌幅'],
+            '成交额': row['成交额'],
+            'time': current_time_str,
+            'auto': False
+        }
+        st.session_state.final_locked = True
+        add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
+        st.rerun()
+
+# 系统日志
+with st.expander("📜 系统日志", expanded=False):
+    if st.session_state.logs:
+        for log in reversed(st.session_state.logs[-10:]):
+            color = "#3498db" if "成功" in log['event'] or "生成" in log['event'] else \
+                    "#e74c3c" if "失败" in log['event'] or "异常" in log['event'] else \
+                    "#f39c12" if "警告" in log['event'] or "延迟" in log['event'] else "#2c3e50"
+            st.markdown(f"""
+            <div style="border-left: 3px solid {color}; padding-left: 10px; margin: 5px 0;">
+                <strong>{log['timestamp']}</strong> - {log['event']}: {log['details']}
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("暂无日志记录")
 
 # 自动刷新
 if is_trading:
-    st.write("⏳ 30秒后自动刷新数据...")
-    time.sleep(30)
+    refresh_time = 30
+    st.write(f"⏳ {refresh_time}秒后自动刷新数据...")
+    time.sleep(refresh_time)
     st.rerun()
 else:
     st.info("⏸️ 当前非交易时间，自动刷新已暂停")
