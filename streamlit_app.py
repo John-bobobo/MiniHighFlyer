@@ -37,7 +37,7 @@ st.set_page_config(page_title="尾盘博弈 6.3 · 互补评分模式", layout="
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "3cc067cf223333d2e817be127a633d440f12de98e12c731905f38392"
+    TUSHARE_TOKEN = "dea49fc606a0945a8d00408b7828e4b6c7fcb3172a750fdeba734add"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -309,7 +309,6 @@ def filter_stocks_by_rule(df):
     if '名称' in filtered.columns:
         filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
     if '涨跌幅' in filtered.columns:
-        # 仅剔除涨停过高等极端情况，不设下限
         filtered = filtered[filtered['涨跌幅'] <= 9.5]
     if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
         filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
@@ -724,8 +723,10 @@ else:
     else:
         MAX_CHECK = 200
         tmp = sector_filtered.copy()
-        # 预排序（涨幅+成交额）
-        tmp['_pre_score'] = (tmp['涨跌幅'].rank(pct=True) + tmp['成交额'].rank(pct=True)) / 2
+        # 添加排名列（用于后续评分）
+        tmp['涨跌幅_pct'] = tmp['涨跌幅'].rank(pct=True)
+        tmp['成交额_pct'] = tmp['成交额'].rank(pct=True)
+        tmp['_pre_score'] = (tmp['涨跌幅_pct'] + tmp['成交额_pct']) / 2
         tmp = tmp.sort_values('_pre_score', ascending=False)
         to_check = tmp.head(MAX_CHECK)
         st.caption(f"将对前 {len(to_check)} 只潜力股进行技术形态评分...")
@@ -739,15 +740,11 @@ else:
             if hist.empty:
                 progress_bar.progress((i+1)/len(to_check))
                 continue
-            # 获取原有的综合得分（需要先计算因子值，这里临时计算或复用已有）
-            # 为简化，我们在此处临时生成一个综合得分（基于现有列简单的百分位排名）
-            # 实际生产中 add_technical_indicators 会为这些股票增加因子，但为了效率，我们直接使用涨跌幅和成交额的百分位估算
-            # 更准确的做法：先对 sector_filtered 批量计算因子，但那样会增加请求次数。
-            # 作为替代，我们利用已有的涨跌幅和成交额计算一个简易综合得分（0-1）
-            temp_score = (row['涨跌幅'].rank(pct=True) + row['成交额'].rank(pct=True)) / 2
+            # 使用预计算的 _pre_score 作为综合得分（0-1范围）
+            temp_score = row['_pre_score']
             # 获得技术形态得分（0-30）
             tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-            # 总得分 = 简易综合得分*70 + tech_score
+            # 总得分 = 综合得分*70 + 技术得分
             final_score = temp_score * 70 + tech_score
             candidates_with_scores.append({
                 '代码': row['代码'],
