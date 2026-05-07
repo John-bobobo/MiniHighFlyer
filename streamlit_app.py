@@ -10,6 +10,7 @@
        ③ 最终总分 = ① + ②
    - 根据策略模式动态调整技术评分标准
 ✅ 优点：不会因某个条件不满足而一票否决，所有股票均有机会，多因子真正发挥作用
+✅ 过滤条件：剔除科创板（688开头）、创业板（300/301开头）
 """
 import sys
 import streamlit as st
@@ -128,7 +129,7 @@ def batch_get_stock_industry(ts_codes):
     return [cache.get(c, '未知') for c in ts_codes]
 
 # ===============================
-# 数据获取
+# 数据获取（剔除科创板和创业板）
 # ===============================
 def fetch_from_tushare():
     try:
@@ -151,6 +152,14 @@ def fetch_from_tushare():
             return None
         df = pd.concat(all_dfs, ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code'])
+        
+        # 剔除科创板（688开头）和创业板（300、301开头）
+        before = len(df)
+        df = df[~df['ts_code'].str.startswith(('688', '300', '301'))]
+        after = len(df)
+        if before > after:
+            add_log("数据源", f"已剔除科创板和创业板股票 {before - after} 只，剩余 {after} 只")
+        
         add_log("数据源", f"合并后共 {len(df)} 条股票数据")
 
         df['涨跌幅'] = (df['close'] - df['pre_close']) / df['pre_close'] * 100
