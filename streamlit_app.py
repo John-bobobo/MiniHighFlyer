@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 主线题材 + 互补评分模式（宽松/标准/严格）
+尾盘博弈 6.3 · 游资蒸馏增强版（MACD/KDJ金叉确认 + 同花顺看多信号加权）
 ===================================================
 ✅ 核心逻辑：
-   - 基础过滤 + 主线板块过滤（只保留前5强行业）
-   - 对前200只潜力股计算：
-       ① 原有综合得分（基于各项因子的百分位排名） → 0-70分
-       ② 技术形态得分（涨幅、量比、三连阳、站上5日线、近5日阳线） → 0-30分
-       ③ 最终总分 = ① + ②
-   - 根据策略模式动态调整技术评分标准
-✅ 优点：不会因某个条件不满足而一票否决，所有股票均有机会，多因子真正发挥作用
-✅ 过滤条件：剔除科创板（688开头）、创业板（300/301开头）
+   1. 大盘环境过滤器（平均涨幅、上涨家数比例）
+   2. 动态阈值调整（根据市场活跃度调整涨幅/换手率门槛）
+   3. 量化抛压识别（剔除尾盘冲高回落的假突破股）
+   4. 游资硬逻辑选股：主线容量中军 + 成交额>门槛 + 涨幅动态 + 市值>50亿 + 换手动态 + 均线多头
+   5. MACD/KDJ 金叉加分（零轴下金叉、KDJ低位金叉）
+   6. 同花顺看多信号模拟（BBI、均线多头、量价配合）加权 0-10 分
+   7. 每日推荐3-5只，按综合分排序；无标的时空仓
+   8. 次日竞价操作建议（止损/止盈/观察条件）
 """
 import sys
 import streamlit as st
@@ -32,13 +32,13 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 互补评分模式", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 游资蒸馏增强版（看多信号加权）", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "3cc067cf223333d2e817be127a633d440f12de98e12c731905f38392"
+    TUSHARE_TOKEN = "b97863ef82aa2e4c9a0df2f20b65090adafe6ecbb6c7d786a32df0b8"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -77,6 +77,7 @@ default_session_vars = {
     "backup_picks": [],
     "candidate_df": pd.DataFrame(),
     "final_locked": False,
+    "stock_basic_cache": {},
 }
 
 for key, default in default_session_vars.items():
@@ -108,6 +109,167 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
+# 增强策略1：大盘环境过滤器
+# ===============================
+def check_market_environment(df_all):
+    if df_all.empty or '涨跌幅' not in df_all.columns:
+        return False, "无有效市场数据"
+    avg_pct = df_all['涨跌幅'].mean()
+    up_count = (df_all['涨跌幅'] > 0).sum()
+    down_count = (df_all['涨跌幅'] < 0).sum()
+    ratio = up_count / (down_count + 1e-6)
+    if avg_pct < -0.8:
+        return False, f"市场普跌: 平均涨幅{avg_pct:.2f}%"
+    if ratio < 0.5:
+        return False, f"上涨家数比例过低: {ratio:.2f}"
+    if avg_pct > -0.3 and ratio > 0.6:
+        return True, f"市场安全: 平均涨幅{avg_pct:.2f}%, 涨跌比{ratio:.2f}"
+    if avg_pct > -0.5 and ratio > 0.4:
+        return True, f"市场偏弱但可接受: 平均涨幅{avg_pct:.2f}%, 涨跌比{ratio:.2f}"
+    return False, f"市场环境不符合: 平均涨幅{avg_pct:.2f}%, 涨跌比{ratio:.2f}"
+
+# ===============================
+# 增强策略2：动态阈值调整
+# ===============================
+def get_dynamic_thresholds(df_all):
+    if df_all.empty or '成交额' not in df_all.columns:
+        return {'min_pct': 2.0, 'max_pct': 6.0, 'min_turnover': 5.0, 'max_turnover': 15.0, 'min_amount': 1e8}
+    median_amount = df_all['成交额'].median() / 1e8
+    if median_amount < 0.5:
+        return {'min_pct': 1.0, 'max_pct': 5.0, 'min_turnover': 3.0, 'max_turnover': 12.0, 'min_amount': 0.5e8}
+    elif median_amount < 0.8:
+        return {'min_pct': 1.5, 'max_pct': 5.5, 'min_turnover': 4.0, 'max_turnover': 13.0, 'min_amount': 0.7e8}
+    else:
+        return {'min_pct': 2.0, 'max_pct': 6.0, 'min_turnover': 5.0, 'max_turnover': 15.0, 'min_amount': 1e8}
+
+# ===============================
+# 增强策略3：量化抛压识别（尾盘冲高回落）
+# ===============================
+def has_quantum_dump_pressure(row, hist_df):
+    if hist_df.empty or len(hist_df) < 6:
+        return False
+    high_pct = row.get('最高涨幅', 0)
+    cur_pct = row['涨跌幅']
+    if high_pct - cur_pct < 2.5:
+        return False
+    avg_vol_5 = hist_df['vol'].tail(5).mean()
+    if avg_vol_5 <= 0:
+        return False
+    vol_ratio = row['成交量'] / avg_vol_5
+    if vol_ratio > 1.3:
+        add_log("抛压识别", f"{row['名称']} 冲高回落 {high_pct:.1f}%->{cur_pct:.1f}% 且放量{vol_ratio:.2f}倍，剔除")
+        return True
+    return False
+
+# ===============================
+# MACD / KDJ 指标计算
+# ===============================
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    if len(close) < slow + signal:
+        return None, None, None
+    exp1 = pd.Series(close).ewm(span=fast, adjust=False).mean()
+    exp2 = pd.Series(close).ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - signal_line
+    return macd.iloc[-1], signal_line.iloc[-1], hist.iloc[-1]
+
+def calculate_kdj(high, low, close, n=9, m1=3, m2=3):
+    if len(close) < n:
+        return None, None, None
+    low_list = low.rolling(n, min_periods=n).min()
+    high_list = high.rolling(n, min_periods=n).max()
+    rsv = (close - low_list) / (high_list - low_list) * 100
+    rsv = rsv.fillna(50)
+    K = rsv.ewm(span=m1, adjust=False).mean()
+    D = K.ewm(span=m2, adjust=False).mean()
+    J = 3 * K - 2 * D
+    return K.iloc[-1], D.iloc[-1], J.iloc[-1]
+
+def check_macd_golden_cross(hist_df):
+    if hist_df.empty or len(hist_df) < 26:
+        return False, 0, "无数据"
+    close = hist_df['close']
+    exp1 = pd.Series(close).ewm(span=12, adjust=False).mean()
+    exp2 = pd.Series(close).ewm(span=26, adjust=False).mean()
+    macd_line = exp1 - exp2
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    if len(macd_line) < 2:
+        return False, 0, "无数据"
+    prev_macd = macd_line.iloc[-2]
+    prev_signal = signal_line.iloc[-2]
+    curr_macd = macd_line.iloc[-1]
+    curr_signal = signal_line.iloc[-1]
+    if prev_macd <= prev_signal and curr_macd > curr_signal:
+        if curr_macd < 0:
+            return True, 5, "零轴下金叉"
+        else:
+            return True, 3, "零轴上金叉"
+    return False, 0, "无金叉"
+
+def check_kdj_golden_cross(hist_df):
+    if hist_df.empty or len(hist_df) < 9:
+        return False, 0, "无数据"
+    high = hist_df['high']
+    low = hist_df['low']
+    close = hist_df['close']
+    k, d, j = calculate_kdj(high, low, close)
+    if k is None or d is None:
+        return False, 0, "无数据"
+    if len(high) < 2 or len(low) < 2 or len(close) < 2:
+        return False, 0, "无数据"
+    prev_k, prev_d, prev_j = calculate_kdj(high[:-1], low[:-1], close[:-1])
+    if prev_k is None or prev_d is None:
+        return False, 0, "无数据"
+    if prev_k <= prev_d and k > d:
+        if j < 20:
+            return True, 5, "KDJ金叉(J<20超卖)"
+        elif j < 30:
+            return True, 3, "KDJ金叉(J<30)"
+        else:
+            return True, 1, "KDJ金叉"
+    return False, 0, "无金叉"
+
+# ===============================
+# 🚀 新增：模拟同花顺“看多”信号加权因子
+# ===============================
+def get_tonghuashun_bull_score(row, hist_df):
+    """
+    模拟同花顺“看多”信号的核心逻辑
+    基于BBI多空指标、均线多头排列、量价配合三个维度打分，最高10分
+    """
+    if hist_df.empty or len(hist_df) < 25:
+        return 0
+    score = 0
+    
+    # 1. BBI多空指标（同花顺核心算法之一）
+    close_series = hist_df['close']
+    bbi = (close_series.rolling(3).mean() + 
+           close_series.rolling(6).mean() + 
+           close_series.rolling(12).mean() + 
+           close_series.rolling(24).mean()) / 4
+    if len(bbi) > 0 and row['最新价'] > bbi.iloc[-1]:
+        score += 4   # 股价在BBI上方，视为多头市场
+    
+    # 2. 均线多头排列增强（与现有系统MA5>MA10>MA20判断一致，额外加分）
+    ma5 = close_series.rolling(5).mean().iloc[-1]
+    ma10 = close_series.rolling(10).mean().iloc[-1]
+    ma20 = close_series.rolling(20).mean().iloc[-1]
+    if not any(np.isnan([ma5, ma10, ma20])) and ma5 > ma10 > ma20:
+        score += 3
+    
+    # 3. 量价配合（成交量放大 + 价格上涨）
+    avg_vol_5 = hist_df['vol'].tail(5).mean()
+    if avg_vol_5 > 0:
+        vr = row['成交量'] / avg_vol_5
+        if vr > 1.2 and row['涨跌幅'] > 0:
+            score += 3
+        elif vr > 1.0 and row['涨跌幅'] > 0:
+            score += 1
+    
+    return min(score, 10)
+
+# ===============================
 # 个股行业信息获取
 # ===============================
 def batch_get_stock_industry(ts_codes):
@@ -128,8 +290,29 @@ def batch_get_stock_industry(ts_codes):
             add_log("行业数据", f"获取行业失败: {str(e)[:50]}")
     return [cache.get(c, '未知') for c in ts_codes]
 
+def batch_get_stock_basic_info(ts_codes):
+    cache = st.session_state.stock_basic_cache
+    need = [c for c in ts_codes if c not in cache]
+    if need:
+        try:
+            today = datetime.now(tz).strftime('%Y%m%d')
+            df = pro.daily_basic(ts_code=','.join(need), trade_date=today, fields='ts_code,circ_mv,turnover_rate')
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    code = row['ts_code']
+                    cache[code] = {
+                        'circ_mv': row['circ_mv'] if pd.notna(row['circ_mv']) else 0,
+                        'turnover_rate': row['turnover_rate'] if pd.notna(row['turnover_rate']) else 0
+                    }
+                add_log("市值数据", f"获取 {len(df)} 只股票的流通市值/换手率")
+            else:
+                add_log("市值数据", "daily_basic 返回空")
+        except Exception as e:
+            add_log("市值数据", f"获取失败: {str(e)[:50]}")
+    return [cache.get(c, {'circ_mv': 0, 'turnover_rate': 0}) for c in ts_codes]
+
 # ===============================
-# 数据获取（剔除科创板和创业板）
+# 数据获取
 # ===============================
 def fetch_from_tushare():
     try:
@@ -153,7 +336,6 @@ def fetch_from_tushare():
         df = pd.concat(all_dfs, ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code'])
         
-        # 剔除科创板（688开头）和创业板（300、301开头）
         before = len(df)
         df = df[~df['ts_code'].str.startswith(('688', '300', '301'))]
         after = len(df)
@@ -182,6 +364,10 @@ def fetch_from_tushare():
         codes = df['代码'].tolist()
         industries = batch_get_stock_industry(codes)
         df['所属行业'] = industries
+        
+        basic_infos = batch_get_stock_basic_info(codes)
+        df['流通市值'] = [b['circ_mv'] for b in basic_infos]
+        df['换手率'] = [b['turnover_rate'] for b in basic_infos]
 
         required = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
         missing = [c for c in required if c not in df.columns]
@@ -189,11 +375,11 @@ def fetch_from_tushare():
             add_log("数据源", f"字段缺失: {missing}")
             return None
 
-        keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '最高价', '最高涨幅']
+        keep_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '最新价', '成交量', '最高价', '最高涨幅', '流通市值', '换手率']
         keep_cols = [c for c in keep_cols if c in df.columns]
         df = df[keep_cols]
 
-        add_log("数据源", f"✅ 成功获取 {len(df)} 条（已填充行业）")
+        add_log("数据源", f"✅ 成功获取 {len(df)} 条（已填充行业、市值、换手率）")
         return df
     except Exception as e:
         add_log("数据源", f"整体异常: {str(e)[:100]}")
@@ -206,7 +392,7 @@ def get_stable_realtime_data():
         st.session_state.data_source = "non_trading"
         st.session_state.last_data_fetch_time = now
         add_log("数据", f"{msg}，返回空数据")
-        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
+        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率'])
 
     df = fetch_from_tushare()
     if df is not None and not df.empty:
@@ -219,7 +405,7 @@ def get_stable_realtime_data():
         st.session_state.data_source = "failed"
         st.session_state.last_data_fetch_time = now
         add_log("数据源", "Tushare 获取失败，返回空")
-        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
+        return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率'])
 
 def get_historical_data(ts_code, end_date=None):
     cache = st.session_state.hist_data_cache
@@ -243,74 +429,66 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 技术形态评分（代替硬性一票否决）
+# 游资技术形态评分（不包含MACD/KDJ，仅量价形态）
 # ===============================
-def score_technical_conditions(row, hist_df, mode):
-    """
-    根据策略模式计算技术形态得分（0-30分）
-    mode: '宽松', '标准', '严格'
-    """
+def score_technical_for_yz(row, hist_df):
     if hist_df.empty or len(hist_df) < 6:
         return 0
     score = 0
     pct = row['涨跌幅']
-    # 1. 涨幅评分（0-10分）
-    if mode == "宽松":
-        if 1 <= pct <= 8:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4.5) * 2)
-    elif mode == "标准":
-        if 2 <= pct <= 6.5:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4.25) * 3)
-    else:  # 严格
-        if 2.5 <= pct <= 5.5:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4) * 4)
+    if 2 <= pct <= 6:
+        score += 10
+    elif 1 <= pct < 2 or 6 < pct <= 8:
+        score += 5
+    else:
+        score += max(0, 3 - abs(pct - 4) * 0.5)
 
-    # 2. 量比评分（0-10分）
     avg_vol_5 = hist_df['vol'].tail(5).mean()
     if avg_vol_5 > 0:
         vr = row['成交量'] / avg_vol_5
-        if mode == "宽松":
-            if 0.8 <= vr <= 2.5:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.65) * 2)
-        elif mode == "标准":
-            if 1.0 <= vr <= 2.0:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.5) * 3)
-        else:  # 严格
-            if 1.2 <= vr <= 1.8:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.5) * 4)
+        if 1.2 <= vr <= 2.0:
+            score += 10
+        elif 1.0 <= vr < 1.2 or 2.0 < vr <= 2.5:
+            score += 5
+        else:
+            score += max(0, 2 - abs(vr - 1.6) * 0.5)
 
-    # 3. 三连阳加分（5分）
-    recent_3 = hist_df['close'].tail(3).values
-    if len(recent_3) == 3 and recent_3[0] < recent_3[1] < recent_3[2]:
+    close_series = hist_df['close']
+    ma5 = close_series.rolling(5).mean().iloc[-1]
+    ma10 = close_series.rolling(10).mean().iloc[-1]
+    ma20 = close_series.rolling(20).mean().iloc[-1]
+    if not any(np.isnan([ma5, ma10, ma20])) and ma5 > ma10 > ma20:
         score += 5
 
-    # 4. 站上5日线加分（5分）
-    ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
     if not np.isnan(ma5) and row['最新价'] >= ma5:
-        score += 5
+        score += 2.5
 
-    # 5. 近5日有阳线（收盘>开盘）加分（5分）
     hist_5 = hist_df.tail(5)
     if ((hist_5['close'] - hist_5['open']) > 0).any():
-        score += 5
+        score += 2.5
 
     return min(score, 30)
 
-# ===============================
-# 原有因子计算函数
-# ===============================
+def calculate_sector_strength(df):
+    if df.empty or '所属行业' not in df.columns:
+        return pd.DataFrame()
+    df['is_limit_up'] = df['涨跌幅'] >= 9.5
+    sector_stats = df.groupby('所属行业').agg({
+        '涨跌幅': 'mean',
+        '成交额': 'sum',
+        'is_limit_up': 'sum',
+        '代码': 'count'
+    }).rename(columns={'代码': '股票数量', 'is_limit_up': '涨停家数'})
+    sector_stats['资金占比'] = sector_stats['成交额'] / sector_stats['成交额'].sum()
+    sector_stats['涨停占比'] = sector_stats['涨停家数'] / max(1, sector_stats['涨停家数'].sum())
+    sector_stats['涨幅得分'] = sector_stats['涨跌幅'].rank(pct=True) * 40
+    sector_stats['资金得分'] = sector_stats['资金占比'].rank(pct=True) * 40
+    sector_stats['涨停得分'] = sector_stats['涨停占比'].rank(pct=True) * 20
+    sector_stats['强度得分'] = sector_stats['涨幅得分'] + sector_stats['资金得分'] + sector_stats['涨停得分']
+    sector_stats = sector_stats.sort_values('强度得分', ascending=False)
+    return sector_stats
+
+# 保留占位函数
 def filter_stocks_by_rule(df):
     if df.empty:
         return df
@@ -321,196 +499,28 @@ def filter_stocks_by_rule(df):
         filtered = filtered[filtered['涨跌幅'] <= 9.5]
     if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
         filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
-    if not filtered.empty and '成交额' in filtered.columns:
-        threshold = max(filtered['成交额'].quantile(0.1), 2e7)
-        filtered = filtered[filtered['成交额'] > threshold]
     return filtered
 
 def calculate_technical_indicators(hist_df):
-    if hist_df.empty or len(hist_df) < 20:
-        return {}
-    hist_df = hist_df.sort_values('trade_date')
-    close = hist_df['close'].values
-    high = hist_df['high'].values
-    low = hist_df['low'].values
-    volume = hist_df['vol'].values
-
-    ma5 = pd.Series(close).rolling(5).mean().iloc[-1] if len(close)>=5 else np.nan
-    ma10 = pd.Series(close).rolling(10).mean().iloc[-1] if len(close)>=10 else np.nan
-    ma20 = pd.Series(close).rolling(20).mean().iloc[-1] if len(close)>=20 else np.nan
-
-    exp1 = pd.Series(close).ewm(span=12, adjust=False).mean()
-    exp2 = pd.Series(close).ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    macd_hist = macd - signal
-    macd_hist_val = macd_hist.iloc[-1] if not macd_hist.empty else np.nan
-    if len(macd)>=2 and len(signal)>=2:
-        macd_golden_cross = (macd.iloc[-2] <= signal.iloc[-2]) and (macd.iloc[-1] > signal.iloc[-1])
-    else:
-        macd_golden_cross = False
-
-    min_low_20 = pd.Series(low).rolling(20).min().iloc[-1] if len(low)>=20 else np.nan
-    cur_close = close[-1]
-    if not np.isnan(min_low_20) and min_low_20 > 0:
-        low_distance = (cur_close - min_low_20) / min_low_20
-    else:
-        low_distance = np.nan
-
-    avg_vol_20 = pd.Series(volume).rolling(20).mean().iloc[-1] if len(volume)>=20 else np.nan
-    bull_mas = (ma5 > ma10) and (ma10 > ma20) if not any(np.isnan([ma5, ma10, ma20])) else False
-
-    return {
-        'ma5': ma5, 'ma10': ma10, 'ma20': ma20,
-        'macd_hist': macd_hist_val, 'macd_golden_cross': macd_golden_cross,
-        'low_distance': low_distance, 'avg_vol_20': avg_vol_20, 'bull_mas': bull_mas,
-    }
+    return {}
 
 def add_technical_indicators(df, top_n=200):
-    if df.empty:
-        return df
-    if '涨跌幅' in df.columns:
-        temp = df.copy()
-        temp['_temp_score'] = temp['涨跌幅'].rank(pct=True) * 0.5 + temp['成交额'].rank(pct=True) * 0.5
-        temp = temp.sort_values('_temp_score', ascending=False).head(top_n)
-        candidates = temp
-    else:
-        candidates = df.head(top_n)
-
-    result_list = []
-    for idx, row in candidates.iterrows():
-        ts_code = row['代码']
-        hist = get_historical_data(ts_code)
-        if hist.empty:
-            new_row = row.to_dict()
-            new_row.update({
-                'ma5': np.nan, 'ma10': np.nan, 'ma20': np.nan,
-                'macd_hist': np.nan, 'macd_golden_cross': False,
-                'low_distance': np.nan, 'vol_ratio_real': np.nan, 'bull_mas': False,
-            })
-        else:
-            tech = calculate_technical_indicators(hist)
-            avg_vol_20 = tech.get('avg_vol_20', np.nan)
-            cur_vol = row['成交量'] if '成交量' in row else np.nan
-            if not np.isnan(avg_vol_20) and avg_vol_20 > 0 and not np.isnan(cur_vol):
-                vol_ratio_real = cur_vol / avg_vol_20
-            else:
-                vol_ratio_real = np.nan
-            new_row = row.to_dict()
-            new_row.update({
-                'ma5': tech.get('ma5', np.nan), 'ma10': tech.get('ma10', np.nan),
-                'ma20': tech.get('ma20', np.nan), 'macd_hist': tech.get('macd_hist', np.nan),
-                'macd_golden_cross': tech.get('macd_golden_cross', False),
-                'low_distance': tech.get('low_distance', np.nan), 'vol_ratio_real': vol_ratio_real,
-                'bull_mas': tech.get('bull_mas', False),
-            })
-        result_list.append(new_row)
-
-    result_df = df.copy()
-    tech_df = pd.DataFrame(result_list)
-    tech_cols = ['代码', 'ma5', 'ma10', 'ma20', 'macd_hist', 'macd_golden_cross',
-                 'low_distance', 'vol_ratio_real', 'bull_mas']
-    result_df = result_df.merge(tech_df[tech_cols], on='代码', how='left')
-    fill_dict = {'macd_golden_cross': False, 'bull_mas': False}
-    for col, val in fill_dict.items():
-        if col in result_df.columns:
-            result_df[col] = result_df[col].fillna(val)
-    return result_df
+    return df
 
 def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=None):
-    if df.empty:
-        return df
-    df_scored = df.copy()
-    total_score = np.zeros(len(df_scored))
-
-    for factor, weight in weights.items():
-        if factor in df_scored.columns and weight != 0:
-            valid = df_scored[factor].notna()
-            if valid.sum() > 0:
-                rank = df_scored[factor].rank(pct=True, method='average')
-                rank = rank.fillna(0.5)
-                total_score += rank * weight
-
-    if 'low_distance' in df_scored.columns and 'vol_ratio_real' in df_scored.columns:
-        low_rank = 1 - df_scored['low_distance'].rank(pct=True, na_option='bottom')
-        vol_rank = df_scored['vol_ratio_real'].rank(pct=True, na_option='bottom')
-        low_vol_score = (low_rank * 0.6 + vol_rank * 0.4) * 0.10
-        total_score += low_vol_score.fillna(0)
-
-    if 'macd_golden_cross' in df_scored.columns:
-        total_score += df_scored['macd_golden_cross'].astype(float) * 0.05
-    if 'bull_mas' in df_scored.columns:
-        total_score += df_scored['bull_mas'].astype(float) * 0.05
-
-    df_scored['综合得分'] = total_score
-
-    risk_penalty = np.zeros(len(df_scored))
-    if '涨跌幅' in df_scored.columns:
-        high_gain = df_scored['涨跌幅'].clip(lower=5, upper=10)
-        risk_penalty += (high_gain - 5) / 50 * 0.15
-    if '波动率' in df_scored.columns:
-        high_vol = df_scored['波动率'].clip(lower=5, upper=15)
-        risk_penalty += (high_vol - 5) / 50 * 0.10
-
-    df_scored['风险调整得分'] = df_scored['综合得分'] - risk_penalty
-    return df_scored.sort_values('风险调整得分', ascending=False)
+    return df
 
 def update_convergence(candidates_df, current_time):
-    if candidates_df.empty:
-        return
-    hour = current_time.hour
-    minute = current_time.minute
-    if hour == 14 and minute < 40:
-        top10 = candidates_df.head(10)
-        record = {'timestamp': current_time.strftime('%H:%M:%S'), 'stocks': []}
-        for _, row in top10.iterrows():
-            record['stocks'].append({
-                '代码': row['代码'],
-                '名称': row['名称'],
-                '得分': row.get('风险调整得分', row.get('综合得分', 0))
-            })
-        st.session_state.convergence_records.append(record)
-        if len(st.session_state.convergence_records) > 80:
-            st.session_state.convergence_records = st.session_state.convergence_records[-80:]
+    pass
 
 def get_final_recommendation_from_convergence():
-    records = st.session_state.convergence_records
-    if not records:
-        return None, []
-    stock_stats = {}
-    for rec in records:
-        for s in rec['stocks']:
-            code = s['代码']
-            if code not in stock_stats:
-                stock_stats[code] = {'名称': s['名称'], 'count': 0, 'total_score': 0.0, 'scores': []}
-            stock_stats[code]['count'] += 1
-            stock_stats[code]['total_score'] += s['得分']
-            stock_stats[code]['scores'].append(s['得分'])
-    for code, stat in stock_stats.items():
-        stat['avg_score'] = stat['total_score'] / stat['count']
-        stat['std_score'] = np.std(stat['scores']) if len(stat['scores']) > 1 else 0
-    total_records = len(records)
-    final_scores = []
-    for code, stat in stock_stats.items():
-        freq = stat['count'] / total_records
-        all_avgs = [s['avg_score'] for s in stock_stats.values()]
-        min_avg, max_avg = min(all_avgs), max(all_avgs)
-        norm_avg = (stat['avg_score'] - min_avg) / (max_avg - min_avg) if max_avg > min_avg else 0.5
-        composite = norm_avg * 0.6 + freq * 0.3 - stat['std_score'] * 0.1
-        final_scores.append((code, stat['名称'], composite))
-    final_scores.sort(key=lambda x: x[2], reverse=True)
-    top3 = final_scores[:3]
-    if not top3:
-        return None, []
-    first = {'代码': top3[0][0], '名称': top3[0][1]}
-    backups = [{'代码': t[0], '名称': t[1]} for t in top3[1:3]]
-    return first, backups
+    return None, []
 
 # ===============================
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 互补评分模式（宽松/标准/严格）")
+st.title("🔥 尾盘博弈 6.3 · 游资蒸馏增强版（MACD/KDJ+看多信号加权）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -523,6 +533,7 @@ if st.session_state.today != now.date():
     st.session_state.a_code_list = None
     st.session_state.hist_data_cache = {}
     st.session_state.stock_industry_cache = {}
+    st.session_state.stock_basic_cache = {}
     st.session_state.convergence_records = []
     st.session_state.backup_picks = []
     st.session_state.candidate_df = pd.DataFrame()
@@ -560,6 +571,7 @@ with st.sidebar:
         st.session_state.a_code_list = None
         st.session_state.hist_data_cache = {}
         st.session_state.stock_industry_cache = {}
+        st.session_state.stock_basic_cache = {}
         st.session_state.candidate_df = pd.DataFrame()
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
@@ -580,31 +592,7 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ⚙️ 多因子权重配置")
-    w_price = st.slider("当日涨幅", 0.0, 0.5, 0.20, 0.05, key="w_price")
-    w_volume = st.slider("成交额", 0.0, 0.5, 0.15, 0.05, key="w_volume")
-    w_momentum = st.slider("5日动量", 0.0, 0.4, 0.15, 0.05, key="w_momentum")
-    w_reversal = st.slider("20日反转", 0.0, 0.3, 0.10, 0.05, key="w_reversal")
-    w_vol_ratio = st.slider("量比", 0.0, 0.3, 0.10, 0.05, key="w_vol_ratio")
-    w_volatility = st.slider("波动率(负)", -0.2, 0.0, -0.05, 0.05, key="w_volatility")
-    total_weight = w_price + w_volume + w_momentum + w_reversal + w_vol_ratio + w_volatility
-    if abs(total_weight - 1.0) > 0.2:
-        st.warning(f"权重和: {total_weight:.2f} (建议调整到1.0附近)")
-    factor_weights = {
-        '涨跌幅': w_price,
-        '成交额': w_volume,
-        '5日动量': w_momentum,
-        '20日反转': w_reversal,
-        '量比': w_vol_ratio,
-        '波动率': w_volatility
-    }
-    
-    st.markdown("---")
-    st.markdown("#### 🎚️ 策略模式选择")
-    strategy_mode = st.selectbox("策略模式", ["宽松模式", "标准模式", "严格模式"], index=1, key="strategy_mode")
-    st.caption("💡 宽松模式信号多 | 标准模式平衡 | 严格模式确定性高")
-    st.markdown("---")
-    st.info("📌 本系统不再采用一票否决制，而是将技术形态转为加分项（0-30分），与多因子得分（0-70分）相加得到总分。")
+    st.info("🚀 固定使用增强策略：大盘择时 + 动态阈值 + 抛压过滤 + MACD/KDJ金叉 + 同花顺看多信号加权")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -632,14 +620,8 @@ with col2:
         period = "休市"
     st.metric("当前时段", period)
 with col3:
-    is_first_rec_time = (13, 30) <= (current_hour, current_minute) < (14, 0)
-    is_final_lock_time = (current_hour, current_minute) >= (14, 40)
-    if is_first_rec_time:
-        st.metric("推荐状态", "🟢 可推荐")
-    elif is_final_lock_time:
-        st.metric("推荐状态", "🔴 需锁定")
-    else:
-        st.metric("推荐状态", "🟡 观察中")
+    is_recommend_time = (current_hour, current_minute) >= (14, 50)
+    st.metric("推荐状态", "🟢 可推荐" if is_recommend_time else "🟡 等待尾盘")
 with col4:
     if period == "午盘" and current_hour >= 14:
         close_time = current_time.replace(hour=15, minute=0, second=0, microsecond=0)
@@ -670,317 +652,264 @@ try:
     </div>
     """, unsafe_allow_html=True)
     if not df.empty:
-        st.success(f"✅ 成功获取 {len(df)} 条真实股票数据（已填充行业）")
+        st.success(f"✅ 成功获取 {len(df)} 条真实股票数据")
         with st.expander("🔍 查看数据样本"):
-            display_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业']
+            display_cols = ['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率']
             display_cols = [c for c in display_cols if c in df.columns]
             st.dataframe(df[display_cols].head(10))
-            col_stat1, col_stat2, col_stat3 = st.columns(3)
-            with col_stat1:
-                st.metric("平均涨幅", f"{df['涨跌幅'].mean():.2f}%")
-            with col_stat2:
-                st.metric("最高涨幅", f"{df['涨跌幅'].max():.2f}%")
-            with col_stat3:
-                if '成交额' in df.columns:
-                    st.metric("总成交额", f"{df['成交额'].sum()/1e8:.1f}亿")
     else:
         if st.session_state.data_source == "non_trading":
             st.info("⏸️ 当前非交易时间，无实时数据。如需测试，请使用左侧「模拟测试」模式。")
         else:
-            st.warning("⚠️ 获取到的数据为空，可能原因：Tushare 权限不足、token错误或接口异常")
+            st.warning("⚠️ 获取到的数据为空")
 except Exception as e:
     st.error(f"❌ 数据获取失败: {str(e)}")
-    df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业'])
+    df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率'])
 
-# 板块分析
-st.markdown("### 📊 板块热度分析（主线题材）")
-if df.empty or '所属行业' not in df.columns:
-    st.info("当前无有效板块数据，跳过板块分析。")
-    top5_sectors = []
+# 大盘环境评估
+st.markdown("### 📊 大盘环境评估")
+market_safe, market_reason = check_market_environment(df)
+if not market_safe:
+    st.error(f"⚠️ 大盘环境不满足开仓条件：{market_reason}")
+    st.warning("今日强烈建议 **空仓**，停止选股。")
+    final_recommendations = []
 else:
-    sector_analysis = df.groupby('所属行业').agg({'涨跌幅': 'mean', '成交额': 'sum', '代码': 'count'})
-    sector_analysis = sector_analysis.rename(columns={'代码': '股票数量'})
-    sector_analysis['资金占比'] = sector_analysis['成交额'] / sector_analysis['成交额'].sum()
-    sector_analysis['强度得分'] = (sector_analysis['涨跌幅'].rank(pct=True) * 40 +
-                                    sector_analysis['资金占比'].rank(pct=True) * 40 +
-                                    sector_analysis['股票数量'].rank(pct=True) * 20)
-    sector_analysis = sector_analysis.sort_values('强度得分', ascending=False)
-    top5_sectors = sector_analysis.head(5).index.tolist()
-    st.success(f"🏆 今日最强主线板块 Top5: {', '.join(top5_sectors)}")
+    st.success(f"✅ 大盘环境符合：{market_reason}，继续选股")
 
-# 选股流程
-st.markdown("### 🎯 互补评分选股引擎（技术形态加分+多因子）")
-if df.empty:
-    st.info("当前无股票数据，无法进行选股。")
-    top_candidate = None
-else:
-    # 基础过滤
-    filtered = filter_stocks_by_rule(df)
-    st.caption(f"基础过滤后股票数: {len(filtered)}")
-    # 主线板块过滤
-    if not top5_sectors:
-        sector_filtered = filtered
-        st.warning("未识别主线板块，使用全市场")
+    # 板块分析
+    st.markdown("### 📊 板块热度分析（主线题材）")
+    if df.empty or '所属行业' not in df.columns:
+        st.info("无有效板块数据")
+        top5_sectors = []
     else:
-        sector_filtered = filtered[filtered['所属行业'].isin(top5_sectors)]
-        st.caption(f"主线板块过滤后股票数: {len(sector_filtered)}")
-    
-    if sector_filtered.empty:
-        st.warning("主线板块内无股票，无法进行选股。")
-        top_candidate = None
-        st.session_state.candidate_df = pd.DataFrame()
+        sector_stats = calculate_sector_strength(df)
+        if not sector_stats.empty:
+            top5_sectors = sector_stats.head(5).index.tolist()
+            st.success(f"🏆 今日最强主线板块 Top5: {', '.join(top5_sectors)}")
+            st.dataframe(sector_stats[['涨跌幅', '成交额', '涨停家数', '强度得分']].head(5))
+        else:
+            top5_sectors = []
+            st.warning("无法识别主线板块")
+
+    # 游资选股核心
+    st.markdown("### 🎯 游资蒸馏选股引擎（MACD/KDJ+看多信号加权）")
+    if df.empty:
+        st.info("无股票数据")
+        final_recommendations = []
     else:
-        MAX_CHECK = 200
-        tmp = sector_filtered.copy()
-        # 添加排名列（用于后续评分）
-        tmp['涨跌幅_pct'] = tmp['涨跌幅'].rank(pct=True)
-        tmp['成交额_pct'] = tmp['成交额'].rank(pct=True)
-        tmp['_pre_score'] = (tmp['涨跌幅_pct'] + tmp['成交额_pct']) / 2
-        tmp = tmp.sort_values('_pre_score', ascending=False)
-        to_check = tmp.head(MAX_CHECK)
-        st.caption(f"将对前 {len(to_check)} 只潜力股进行技术形态评分...")
+        filtered = filter_stocks_by_rule(df)
+        st.caption(f"基础过滤后股票数: {len(filtered)}")
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        candidates_with_scores = []
-        for i, (idx, row) in enumerate(to_check.iterrows()):
-            status_text.text(f"正在分析 {i+1}/{len(to_check)}: {row['名称']}")
-            hist = get_historical_data(row['代码'])
-            if hist.empty:
-                progress_bar.progress((i+1)/len(to_check))
-                continue
-            # 使用预计算的 _pre_score 作为综合得分（0-1范围）
-            temp_score = row['_pre_score']
-            # 获得技术形态得分（0-30）
-            tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-            # 总得分 = 综合得分*70 + 技术得分
-            final_score = temp_score * 70 + tech_score
-            candidates_with_scores.append({
-                '代码': row['代码'],
-                '名称': row['名称'],
-                '涨跌幅': row['涨跌幅'],
-                '成交额': row['成交额'],
-                '最新价': row['最新价'],
-                '技术得分': tech_score,
-                '综合得分': temp_score * 70,
-                '最终总分': final_score,
-                '所属行业': row['所属行业']
-            })
-            progress_bar.progress((i+1)/len(to_check))
-        progress_bar.empty()
-        status_text.empty()
+        if not top5_sectors:
+            sector_filtered = filtered
+            st.warning("未识别主线板块，使用全市场")
+        else:
+            sector_filtered = filtered[filtered['所属行业'].isin(top5_sectors)]
+            st.caption(f"主线板块过滤后股票数: {len(sector_filtered)}")
         
-        if not candidates_with_scores:
-            st.warning("未获取到任何候选股票（可能是历史数据获取失败）。")
-            top_candidate = None
-            st.session_state.candidate_df = pd.DataFrame()
+        if sector_filtered.empty:
+            st.warning("主线板块内无股票，今日建议空仓")
+            final_recommendations = []
         else:
-            scored_df = pd.DataFrame(candidates_with_scores)
-            scored_df = scored_df.sort_values('最终总分', ascending=False)
-            top_candidates = scored_df.head(10)
-            top_candidate = top_candidates.iloc[0].to_dict() if not top_candidates.empty else None
+            thresholds = get_dynamic_thresholds(df)
+            st.caption(f"动态阈值: 涨幅{thresholds['min_pct']:.1f}%~{thresholds['max_pct']:.1f}%, "
+                       f"换手率{thresholds['min_turnover']:.1f}%~{thresholds['max_turnover']:.1f}%, "
+                       f"成交额>{thresholds['min_amount']/1e8:.1f}亿")
             
-            st.session_state.candidate_df = top_candidates.copy()
+            sector_filtered = sector_filtered[
+                (sector_filtered['流通市值'] > 500000) &
+                (sector_filtered['换手率'] >= thresholds['min_turnover']) &
+                (sector_filtered['换手率'] <= thresholds['max_turnover']) &
+                (sector_filtered['涨跌幅'] >= thresholds['min_pct']) &
+                (sector_filtered['涨跌幅'] <= thresholds['max_pct']) &
+                (sector_filtered['成交额'] > thresholds['min_amount'])
+            ]
+            st.caption(f"动态硬性门槛后股票数: {len(sector_filtered)}")
             
-            st.markdown("#### 📈 优选股票综合分析")
-            if top_candidate:
-                col_info, col_factors = st.columns([1, 2])
-                with col_info:
-                    st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
-                    st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
-                    st.metric("**最终总分**", f"{top_candidate.get('最终总分', 0):.2f}")
-                    st.metric("**技术得分**", f"{top_candidate.get('技术得分', 0):.2f}/30")
-                    st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.2f}/70")
-                    if '涨跌幅' in top_candidate:
-                        st.metric("**今日涨幅**", f"{top_candidate['涨跌幅']:.2f}%")
-                with col_factors:
-                    st.write("技术形态评分细则（基于当前策略模式）")
-                    st.write("- 涨幅+量比: 0-20分")
-                    st.write("- 三连阳: +5分")
-                    st.write("- 站上5日线: +5分")
-                    st.write("- 近5日有阳线: +5分")
-            
-            st.markdown("#### 🏆 候选股票排名 (按最终总分前5)")
-            if not top_candidates.empty:
-                display_df = top_candidates[['名称', '代码', '涨跌幅', '成交额', '技术得分', '综合得分', '最终总分']].head().copy()
-                display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
-                display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
-                display_df['技术得分'] = display_df['技术得分'].apply(lambda x: f"{x:.1f}")
-                display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.1f}")
-                display_df['最终总分'] = display_df['最终总分'].apply(lambda x: f"{x:.1f}")
-                st.dataframe(display_df, use_container_width=True)
-            
-            # 收敛记录（下午2:00-2:40）
-            if current_hour == 14 and current_minute < 40:
-                update_convergence(top_candidates, current_time)
-            
-            # 14:40 自动锁定最终推荐
-            if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
-                final_rec, backups = get_final_recommendation_from_convergence()
-                if final_rec:
-                    stock_info = scored_df[scored_df['代码'] == final_rec['代码']].iloc[0].to_dict()
-                    st.session_state.final_pick = {
-                        'name': stock_info.get('名称', final_rec['名称']),
-                        'code': final_rec['代码'],
-                        '涨跌幅': float(stock_info.get('涨跌幅', 0)),
-                        '成交额': float(stock_info.get('成交额', 0)),
-                        'time': current_time_str,
-                        'auto': True,
-                        'final_score': float(stock_info.get('最终总分', 0)),
-                        'sector': ', '.join(top5_sectors),
-                        'data_source': st.session_state.data_source
-                    }
-                    st.session_state.locked = True
-                    st.session_state.backup_picks = []
-                    for b in backups:
-                        b_info = scored_df[scored_df['代码'] == b['代码']].iloc[0].to_dict()
-                        st.session_state.backup_picks.append({
-                            'name': b_info.get('名称', b['名称']),
-                            'code': b['代码'],
-                            '涨跌幅': float(b_info.get('涨跌幅', 0)),
-                        })
-                    add_log("自动推荐", f"收敛锁定最终推荐: {final_rec['名称']}")
-                    st.rerun()
-            
-            st.session_state.test_top_stock = {
-                'name': top_candidate.get('名称', ''),
-                'code': top_candidate.get('代码', ''),
-                '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
-                '成交额': float(top_candidate.get('成交额', 0)),
-                '最终总分': float(top_candidate.get('最终总分', 0)),
-                'time': current_time_str,
-                'sector': ', '.join(top5_sectors) if top5_sectors else '全市场',
-                'data_source': st.session_state.data_source
-            }
+            if sector_filtered.empty:
+                st.warning("当前无股票满足动态阈值条件，今日建议空仓")
+                final_recommendations = []
+            else:
+                MAX_CHECK = min(200, len(sector_filtered))
+                tmp = sector_filtered.sort_values('成交额', ascending=False).head(MAX_CHECK)
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                candidates = []
+                
+                all_vol_rank = tmp['成交额'].rank(pct=True)
+                all_circ_mv_rank = tmp['流通市值'].rank(pct=True)
+                all_turnover_rank = tmp['换手率'].rank(pct=True)
+                
+                for i, (idx, row) in enumerate(tmp.iterrows()):
+                    status_text.text(f"正在分析 {i+1}/{len(tmp)}: {row['名称']}")
+                    hist = get_historical_data(row['代码'])
+                    if hist.empty:
+                        progress_bar.progress((i+1)/len(tmp))
+                        continue
+                    
+                    if has_quantum_dump_pressure(row, hist):
+                        progress_bar.progress((i+1)/len(tmp))
+                        continue
+                    
+                    tech_score = score_technical_for_yz(row, hist)
+                    
+                    # 基础分项
+                    vol_score = all_vol_rank.iloc[i] * 30
+                    pct = row['涨跌幅']
+                    if thresholds['min_pct'] <= pct <= thresholds['max_pct']:
+                        pct_match = 20
+                    elif pct < thresholds['min_pct']:
+                        pct_match = max(0, 20 - (thresholds['min_pct'] - pct) * 5)
+                    else:
+                        pct_match = max(0, 20 - (pct - thresholds['max_pct']) * 5)
+                    
+                    mv_score = all_circ_mv_rank.iloc[i] * 15
+                    
+                    hist_close = hist['close']
+                    ma5 = hist_close.rolling(5).mean().iloc[-1]
+                    ma10 = hist_close.rolling(10).mean().iloc[-1]
+                    ma20 = hist_close.rolling(20).mean().iloc[-1]
+                    ma_score = 10 if (not any(np.isnan([ma5, ma10, ma20])) and ma5 > ma10 > ma20) else 0
+                    
+                    avg_vol_5 = hist['vol'].tail(5).mean()
+                    if avg_vol_5 > 0:
+                        vr = row['成交量'] / avg_vol_5
+                        if 1.2 <= vr <= 2.0:
+                            vr_score = 10
+                        elif 1.0 <= vr < 1.2 or 2.0 < vr <= 2.5:
+                            vr_score = 7
+                        else:
+                            vr_score = max(0, 10 - abs(vr - 1.6) * 3)
+                    else:
+                        vr_score = 0
+                    
+                    turnover_score = all_turnover_rank.iloc[i] * 10
+                    
+                    sector_avg = sector_stats.loc[row['所属行业'], '涨跌幅'] if row['所属行业'] in sector_stats.index else 0
+                    rel_strength = row['涨跌幅'] - sector_avg
+                    rel_score = np.clip((rel_strength + 2) / 5 * 5, 0, 5)
+                    
+                    # MACD/KDJ 金叉加分
+                    macd_golden, macd_bonus, macd_desc = check_macd_golden_cross(hist)
+                    kdj_golden, kdj_bonus, kdj_desc = check_kdj_golden_cross(hist)
+                    extra_bonus = macd_bonus + kdj_bonus
+                    
+                    # 🚀 同花顺看多信号加权
+                    bull_score = get_tonghuashun_bull_score(row, hist)
+                    
+                    total_score = vol_score + pct_match + mv_score + ma_score + vr_score + turnover_score + rel_score + extra_bonus + bull_score
+                    total_score = min(100, max(0, total_score))
+                    
+                    candidates.append({
+                        '代码': row['代码'],
+                        '名称': row['名称'],
+                        '涨跌幅': row['涨跌幅'],
+                        '成交额': row['成交额'],
+                        '最新价': row['最新价'],
+                        '流通市值': row['流通市值'],
+                        '换手率': row['换手率'],
+                        '所属行业': row['所属行业'],
+                        '游资综合分': total_score,
+                        '技术形态分': tech_score,
+                        '成交额排名分': vol_score,
+                        '涨幅匹配分': pct_match,
+                        '市值排名分': mv_score,
+                        '均线多头分': ma_score,
+                        '量比匹配分': vr_score,
+                        '换手率排名分': turnover_score,
+                        '相对强度分': rel_score,
+                        'MACD金叉': macd_desc,
+                        'KDJ金叉': kdj_desc,
+                        '金叉加分': extra_bonus,
+                        '看多信号分': bull_score
+                    })
+                    progress_bar.progress((i+1)/len(tmp))
+                
+                progress_bar.empty()
+                status_text.empty()
+                
+                if not candidates:
+                    st.warning("未获取到任何候选股票，今日建议空仓")
+                    final_recommendations = []
+                else:
+                    candidates_df = pd.DataFrame(candidates)
+                    candidates_df = candidates_df.sort_values('游资综合分', ascending=False)
+                    final_recommendations = candidates_df.head(5).to_dict('records')
+                    st.success(f"✅ 共选出 {len(final_recommendations)} 只满足游资逻辑的标的")
+                    
+                    if final_recommendations:
+                        display_df = pd.DataFrame(final_recommendations)
+                        display_cols = ['名称', '代码', '涨跌幅', '成交额', '流通市值', '换手率', '所属行业', '游资综合分', 'MACD金叉', 'KDJ金叉', '看多信号分']
+                        display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
+                        display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
+                        display_df['流通市值'] = display_df['流通市值'].apply(lambda x: f"{x/1e4:.1f}亿")
+                        display_df['换手率'] = display_df['换手率'].apply(lambda x: f"{x:.2f}%")
+                        display_df['游资综合分'] = display_df['游资综合分'].apply(lambda x: f"{x:.1f}")
+                        st.dataframe(display_df[display_cols], use_container_width=True)
+                        
+                        st.session_state.candidate_df = candidates_df.head(10)
 
-# 自动推荐（首次推荐13:30-14:00）
-st.markdown("### 🤖 自动推荐系统")
-use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
-if not use_real_data:
-    st.info("⏸️ 当前非交易时间或无实时数据，自动推荐已暂停")
+# 推荐显示
+st.markdown("### 📋 游资推荐结果（尾盘30分钟）")
+if is_recommend_time and final_recommendations:
+    st.subheader("🏆 今日游资组合（按综合分排序）")
+    for idx, rec in enumerate(final_recommendations[:5], 1):
+        buy_price = rec['最新价']
+        stop_loss = buy_price * 0.98
+        take_profit_1 = buy_price * 1.05
+        take_profit_2 = buy_price * 1.08
+        
+        macd_tag = f"🟢 {rec['MACD金叉']}" if rec['MACD金叉'] != "无金叉" else "⚪ 无MACD金叉"
+        kdj_tag = f"🟢 {rec['KDJ金叉']}" if rec['KDJ金叉'] != "无金叉" else "⚪ 无KDJ金叉"
+        bull_tag = f"🟢 看多信号 {rec['看多信号分']:.0f}/10" if rec['看多信号分'] >= 6 else f"🟡 看多信号 {rec['看多信号分']:.0f}/10"
+        
+        with st.container():
+            st.markdown(f"""
+            <div style="background-color: #f0f9ff; padding: 15px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #e67e22;">
+                <h4>#{idx} {rec['名称']} ({rec['代码']})</h4>
+                <p><strong>📈 涨幅:</strong> {rec['涨跌幅']:.2f}% &nbsp;|&nbsp;
+                <strong>💰 成交额:</strong> {rec['成交额']/1e8:.2f}亿 &nbsp;|&nbsp;
+                <strong>💎 流通市值:</strong> {rec['流通市值']/1e4:.1f}亿 &nbsp;|&nbsp;
+                <strong>🔄 换手率:</strong> {rec['换手率']:.2f}% &nbsp;|&nbsp;
+                <strong>📊 板块:</strong> {rec['所属行业']}</p>
+                <p><strong>🎯 游资综合分:</strong> {rec['游资综合分']:.1f}/100 &nbsp;|&nbsp;
+                <strong>📈 金叉加分:</strong> +{rec['金叉加分']} &nbsp;|&nbsp;
+                <strong>📊 看多信号分:</strong> +{rec['看多信号分']}</p>
+                <p><strong>✅ 技术确认:</strong> {macd_tag} &nbsp; {kdj_tag} &nbsp; {bull_tag}</p>
+                <p><strong>📝 买入逻辑:</strong> 主线{rec['所属行业']}容量中军，温和放量，均线多头，无量化抛压。</p>
+                <hr>
+                <p><strong>⏰ 次日操作建议（竞价观察）:</strong><br>
+                🔹 9:25集合竞价若开盘价低于 {stop_loss:.2f} (-2%)，立即挂单止损。<br>
+                🔹 若开盘价高于 {buy_price*1.015:.2f} (+1.5%)，可持有观察至10:00。<br>
+                🔹 止盈计划：触及 {take_profit_1:.2f} (+5%) 减半仓，触及 {take_profit_2:.2f} (+8%) 清仓。<br>
+                🔹 尾盘若未触发止盈止损，收盘前跌破 {stop_loss:.2f} 则坚决止损。</p>
+            </div>
+            """, unsafe_allow_html=True)
+elif not is_recommend_time:
+    st.info("⏰ 尾盘推荐时段：14:50之后，当前请等待")
 else:
-    if is_first_rec_time and st.session_state.morning_pick is None and top_candidate is not None:
-        st.session_state.morning_pick = {
-            'name': top_candidate.get('名称', ''),
-            'code': top_candidate.get('代码', ''),
-            '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
-            '成交额': float(top_candidate.get('成交额', 0)),
-            'time': current_time_str,
-            'auto': True,
-            'final_score': float(top_candidate.get('最终总分', 0)),
-            'sector': top_candidate.get('所属行业', '主线板块'),
-            'data_source': st.session_state.data_source
-        }
-        add_log("自动推荐", f"生成首次推荐: {top_candidate.get('名称', '')}")
-        st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
-        st.rerun()
-
-# ===============================
-# 推荐显示区域
-# ===============================
-st.markdown("---")
-st.markdown("### 📋 推荐结果")
-col_rec1, col_rec2 = st.columns(2)
-with col_rec1:
-    st.subheader("🕐 首次推荐 (13:30-14:00)")
-    if st.session_state.morning_pick is not None:
-        pick = st.session_state.morning_pick
-        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
-        st.markdown(f"""
-        <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
-            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
-            <p><strong>📅 推荐时间:</strong> {pick['time']}</p>
-            <p><strong>📈 当前涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
-            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
-            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
-            <p><strong>🔧 来源:</strong> {'自动生成' if pick.get('auto', False) else '手动设置'}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        if pick['涨跌幅'] > 6:
-            st.warning("📝 **操作建议**: 涨幅较大，建议观望或轻仓参与")
-        elif pick.get('涨跌幅', 0) < 0:
-            st.info("📝 **操作建议**: 当前下跌，观察是否有反弹机会")
-        else:
-            st.success("📝 **操作建议**: 可考虑逢低关注")
-    else:
-        if is_first_rec_time:
-            if use_real_data and top_candidate is not None:
-                st.info("⏳ 正在自动生成首次推荐...")
-            else:
-                st.info("⏸️ 等待真实数据或合适标的")
-        else:
-            st.info("⏰ 首次推荐时段: 13:30-14:00")
-
-with col_rec2:
-    st.subheader("🎯 最终锁定 (14:40后)")
-    if st.session_state.final_pick is not None:
-        pick = st.session_state.final_pick
-        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
-        st.markdown(f"""
-        <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
-            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
-            <p><strong>📅 锁定时间:</strong> {pick['time']}</p>
-            <p><strong>📈 锁定涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
-            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
-            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
-            <p><strong>🔒 状态:</strong> {'已锁定' if st.session_state.locked else '未锁定'}</p>
-            <p><strong>🔧 来源:</strong> {'自动锁定' if pick.get('auto', False) else '手动设置'}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.session_state.backup_picks:
-            st.markdown("#### 🥈 备选推荐")
-            for i, b in enumerate(st.session_state.backup_picks, 1):
-                st.write(f"{i}. {b['name']} ({b['code']}) 涨幅 {b['涨跌幅']:.2f}%")
-        st.markdown("#### 📋 明日操作计划")
-        if pick['涨跌幅'] < 0:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "10-20%", "低仓位")
-            with col_b:
-                st.metric("止损位", "-3%", "严格止损")
-        elif pick['涨跌幅'] < 3:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "20-30%", "适中仓位")
-            with col_b:
-                st.metric("止损位", "-2%", "正常止损")
-        else:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "15-25%", "谨慎参与")
-            with col_b:
-                st.metric("止损位", "-2.5%", "适度止损")
-        st.info("💡 **提示**: 建议次日开盘观察10-30分钟再决定是否介入")
-    else:
-        if is_final_lock_time:
-            if use_real_data and top_candidate is not None:
-                st.info("⏳ 正在收敛计算最终推荐...")
-            else:
-                st.info("⏸️ 等待真实数据或合适标的")
-        else:
-            st.info("⏰ 最终锁定时段: 14:40后")
+    st.warning("⚠️ 今日没有满足游资硬逻辑的标的，建议空仓等待机会")
 
 # 手动选择
-if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
-    st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
-    manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
-    selected = st.selectbox("从候选池中手动选择一只股票:", list(manual_options.keys()))
-    if st.button("✅ 设为首选（覆盖最终推荐）"):
+if final_recommendations:
+    st.markdown("#### 🖱️ 手动选择（从上述推荐中挑选）")
+    manual_options = {f"{r['名称']} ({r['代码']})": i for i, r in enumerate(final_recommendations)}
+    selected = st.selectbox("请选择一只股票:", list(manual_options.keys()))
+    if st.button("✅ 确认选中"):
         idx = manual_options[selected]
-        row = st.session_state.candidate_df.iloc[idx]
+        rec = final_recommendations[idx]
         st.session_state.final_pick = {
-            'name': row['名称'],
-            'code': row['代码'],
-            '涨跌幅': row['涨跌幅'],
-            '成交额': row['成交额'],
+            'name': rec['名称'],
+            'code': rec['代码'],
+            '涨跌幅': rec['涨跌幅'],
+            '成交额': rec['成交额'],
             'time': current_time_str,
             'auto': False,
-            'final_score': row['最终总分']
+            'final_score': rec['游资综合分'],
+            'sector': rec['所属行业']
         }
-        st.session_state.final_locked = True
-        add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
+        st.success(f"已手动锁定 {rec['名称']}")
         st.rerun()
 
 # 系统日志
