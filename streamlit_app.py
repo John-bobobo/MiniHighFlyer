@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 互补评分模式（确定性增强版）
+尾盘博弈 6.3 · 互补评分模式（确定性增强版 + 5日板块动量）
 ===================================================
 ✅ 核心逻辑（优化后）：
    - 大盘环境过滤（平均涨幅>-1.2%，涨跌比>0.4）
    - 容量中军过滤（流通市值>50亿，换手率5%-15%）
    - 量化抛压识别（冲高回落超2.5%且放量>1.3倍剔除）
    - 炸板直接剔除（曾涨停未封死）
-   - 主线板块过滤（前5强行业，强度算法优化）
+   - 主线板块过滤：使用【当日强度(40%) + 5日动量强度(60%)】加权得分，取前5强行业
    - 对候选股票计算：
        ① 原有综合得分（0-70分）
        ② 技术形态得分（0-30分）
@@ -16,7 +16,7 @@
        ⑤ 尾盘分时稳定加分（收盘前涨幅>-0.5% → +3分）
        ⑥ 最终总分 = ①+②+③+④+⑤
    - 每日推荐3-5只，按总分排序；无标的时空仓
-✅ 优点：大幅减少假信号，提高确定性，空仓信号明确
+✅ 优点：大幅减少假信号，提高确定性，空仓信号明确，且能提前捕捉主线板块启动。
 """
 import sys
 import streamlit as st
@@ -32,19 +32,19 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 确定性增强版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 确定性增强版（板块动量）", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "02e08c0f5888ccf165451ec5509a6b1f8d76db083c77b3de63f7eaa5"
+    TUSHARE_TOKEN = "e558b84fba99094e352dbdd766463eb44cfecb09b4729343fee23722"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -83,8 +83,8 @@ default_session_vars = {
     "backup_picks": [],
     "candidate_df": pd.DataFrame(),
     "final_locked": False,
-    "stock_basic_cache": {},      # 缓存流通市值/换手率
-    "moneyflow_cache": {},        # 缓存资金流向
+    "stock_basic_cache": {},
+    "moneyflow_cache": {},
 }
 
 for key, default in default_session_vars.items():
@@ -116,7 +116,7 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
-# 新增：大盘环境过滤器
+# 大盘环境过滤器
 # ===============================
 def check_market_environment(df_all):
     if df_all.empty or '涨跌幅' not in df_all.columns:
@@ -132,14 +132,13 @@ def check_market_environment(df_all):
     return True, f"市场可交易: 平均涨幅{avg_pct:.2f}%, 涨跌比{ratio:.2f}"
 
 # ===============================
-# 新增：获取流通市值、换手率（批量）
+# 获取流通市值、换手率（批量）
 # ===============================
 def batch_get_stock_basic_info(ts_codes, trade_date):
     cache = st.session_state.stock_basic_cache
     need = [c for c in ts_codes if c not in cache]
     if need:
         try:
-            # 分批获取，防止数量过多
             for i in range(0, len(need), 100):
                 batch = need[i:i+100]
                 df = pro.daily_basic(ts_code=','.join(batch), trade_date=trade_date, fields='ts_code,circ_mv,turnover_rate')
@@ -157,7 +156,7 @@ def batch_get_stock_basic_info(ts_codes, trade_date):
     return [cache.get(c, {'circ_mv': 0, 'turnover_rate': 0}) for c in ts_codes]
 
 # ===============================
-# 新增：获取主力资金流向（批量）
+# 获取主力资金流向（批量）
 # ===============================
 def batch_get_moneyflow(ts_codes, trade_date):
     cache = st.session_state.moneyflow_cache
@@ -180,7 +179,7 @@ def batch_get_moneyflow(ts_codes, trade_date):
     return [cache.get(c, {'net_inflow_pct': 0}) for c in ts_codes]
 
 # ===============================
-# 个股行业信息获取（优化版）
+# 个股行业信息获取
 # ===============================
 def batch_get_stock_industry(ts_codes):
     cache = st.session_state.stock_industry_cache
@@ -225,7 +224,6 @@ def fetch_from_tushare():
         df = pd.concat(all_dfs, ignore_index=True)
         df = df.drop_duplicates(subset=['ts_code'])
         
-        # 剔除科创板（688开头）和创业板（300、301开头）
         before = len(df)
         df = df[~df['ts_code'].str.startswith(('688', '300', '301'))]
         after = len(df)
@@ -252,17 +250,14 @@ def fetch_from_tushare():
         df = df.rename(columns=rename_cols)
 
         codes = df['代码'].tolist()
-        # 行业
         industries = batch_get_stock_industry(codes)
         df['所属行业'] = industries
         
-        # 流通市值、换手率
         today_str = datetime.now(tz).strftime('%Y%m%d')
         basic_infos = batch_get_stock_basic_info(codes, today_str)
-        df['流通市值'] = [b['circ_mv'] for b in basic_infos]   # 单位：万元
-        df['换手率'] = [b['turnover_rate'] for b in basic_infos]  # 百分比
+        df['流通市值'] = [b['circ_mv'] for b in basic_infos]
+        df['换手率'] = [b['turnover_rate'] for b in basic_infos]
         
-        # 主力资金净流入占比
         moneyflows = batch_get_moneyflow(codes, today_str)
         df['主力净流入占比'] = [m['net_inflow_pct'] for m in moneyflows]
 
@@ -327,7 +322,7 @@ def get_historical_data(ts_code, end_date=None):
         return pd.DataFrame()
 
 # ===============================
-# 新增：MACD/KDJ 计算函数
+# MACD/KDJ 计算函数
 # ===============================
 def calculate_macd(close, fast=12, slow=26, signal=9):
     if len(close) < slow + signal:
@@ -367,9 +362,9 @@ def get_macd_bonus(hist_df):
     curr_signal = signal_line.iloc[-1]
     if prev_macd <= prev_signal and curr_macd > curr_signal:
         if curr_macd < 0:
-            return 5   # 零轴下金叉
+            return 5
         else:
-            return 3   # 零轴上金叉
+            return 3
     return 0
 
 def get_kdj_bonus(hist_df):
@@ -396,7 +391,7 @@ def get_kdj_bonus(hist_df):
     return 0
 
 # ===============================
-# 新增：量化抛压识别
+# 量化抛压识别
 # ===============================
 def has_quantum_dump_pressure(row, hist_df):
     if hist_df.empty or len(hist_df) < 6:
@@ -414,17 +409,13 @@ def has_quantum_dump_pressure(row, hist_df):
     return False
 
 # ===============================
-# 技术形态评分（保留原函数，增加新的加分项）
+# 技术形态评分
 # ===============================
 def score_technical_conditions(row, hist_df, mode):
-    """
-    原技术形态得分（0-30分）
-    """
     if hist_df.empty or len(hist_df) < 6:
         return 0
     score = 0
     pct = row['涨跌幅']
-    # 1. 涨幅评分（0-10分）
     if mode == "宽松":
         if 1 <= pct <= 8:
             score += 10
@@ -435,13 +426,12 @@ def score_technical_conditions(row, hist_df, mode):
             score += 10
         else:
             score += max(0, 10 - abs(pct - 4.25) * 3)
-    else:  # 严格
+    else:
         if 2.5 <= pct <= 5.5:
             score += 10
         else:
             score += max(0, 10 - abs(pct - 4) * 4)
 
-    # 2. 量比评分（0-10分）
     avg_vol_5 = hist_df['vol'].tail(5).mean()
     if avg_vol_5 > 0:
         vr = row['成交量'] / avg_vol_5
@@ -455,23 +445,20 @@ def score_technical_conditions(row, hist_df, mode):
                 score += 10
             else:
                 score += max(0, 10 - abs(vr - 1.5) * 3)
-        else:  # 严格
+        else:
             if 1.2 <= vr <= 1.8:
                 score += 10
             else:
                 score += max(0, 10 - abs(vr - 1.5) * 4)
 
-    # 3. 三连阳加分（5分）
     recent_3 = hist_df['close'].tail(3).values
     if len(recent_3) == 3 and recent_3[0] < recent_3[1] < recent_3[2]:
         score += 5
 
-    # 4. 站上5日线加分（5分）
     ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
     if not np.isnan(ma5) and row['最新价'] >= ma5:
         score += 5
 
-    # 5. 近5日有阳线（收盘>开盘）加分（5分）
     hist_5 = hist_df.tail(5)
     if ((hist_5['close'] - hist_5['open']) > 0).any():
         score += 5
@@ -479,50 +466,11 @@ def score_technical_conditions(row, hist_df, mode):
     return min(score, 30)
 
 # ===============================
-# 原有因子计算函数（保持不变）
+# 板块强度计算（当日）
 # ===============================
-def filter_stocks_by_rule(df):
-    if df.empty:
-        return df
-    filtered = df.copy()
-    if '名称' in filtered.columns:
-        filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
-    if '涨跌幅' in filtered.columns:
-        filtered = filtered[filtered['涨跌幅'] <= 9.5]
-    if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
-        filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
-    # 基础成交额过滤（前10%门槛，但最少2千万）
-    if not filtered.empty and '成交额' in filtered.columns:
-        threshold = max(filtered['成交额'].quantile(0.1), 2e7)
-        filtered = filtered[filtered['成交额'] > threshold]
-    return filtered
-
-def calculate_technical_indicators(hist_df):
-    # 保留原函数用于兼容，但实际评分已使用新的技术形态函数
-    return {}
-
-def add_technical_indicators(df, top_n=200):
-    # 保留空实现
-    return df
-
-def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=None):
-    # 保留原函数，新版选股不再调用此函数，为兼容性保留
-    return df
-
-def update_convergence(candidates_df, current_time):
-    # 保留原函数，但新版不再使用收敛机制，为空实现
-    pass
-
-def get_final_recommendation_from_convergence():
-    return None, []
-
-# ===============================
-# 新版板块强度计算（优化）
-# ===============================
-def calculate_sector_strength(df):
+def calculate_sector_strength_today(df):
     if df.empty or '所属行业' not in df.columns:
         return pd.DataFrame()
-    # 使用平均涨幅+资金占比+涨停家数
     df['is_limit_up'] = df['涨跌幅'] >= 9.5
     sector = df.groupby('所属行业').agg({
         '涨跌幅': 'mean',
@@ -535,14 +483,114 @@ def calculate_sector_strength(df):
     sector['强度得分'] = (sector['涨跌幅'].rank(pct=True) * 40 +
                           sector['资金占比'].rank(pct=True) * 40 +
                           sector['涨停占比'].rank(pct=True) * 20)
-    sector = sector.sort_values('强度得分', ascending=False)
     return sector
+
+# ===============================
+# 新增：计算过去5日板块动量（基于历史日线数据）
+# ===============================
+def calculate_sector_momentum_5d(df_today, hist_data_cache, industry_cache):
+    """
+    利用缓存中的历史日线数据，计算每个股票过去5日的平均涨幅，然后按行业聚合得到过去5日行业平均涨幅，
+    再将其与当日强度得分结合，返回加权后的板块强度得分。
+    """
+    if df_today.empty or '所属行业' not in df_today.columns:
+        return pd.DataFrame()
+    
+    # 获取所有股票代码及其行业
+    codes = df_today['代码'].tolist()
+    industries = df_today['所属行业'].tolist()
+    stock_to_industry = {code: ind for code, ind in zip(codes, industries)}
+    
+    # 计算每个股票过去5日的平均涨幅（使用缓存的历史数据）
+    stock_5d_avg_pct = {}
+    for code in codes:
+        hist = hist_data_cache.get(code)
+        if hist is None or hist.empty:
+            # 如果没有历史数据，尝试获取
+            hist = get_historical_data(code)
+        if hist is not None and not hist.empty and len(hist) >= 6:
+            # 取最近5个交易日（不包括今日，因为今日数据在df_today中）
+            # 注意：hist中trade_date是倒序？get_historical_data已排序升序，取最后5条
+            last_5 = hist.tail(5)['close'].values
+            if len(last_5) == 5:
+                # 计算5日涨幅（相对于5天前）
+                pct_5d = (last_5[-1] - last_5[0]) / last_5[0] * 100
+                stock_5d_avg_pct[code] = pct_5d
+            else:
+                stock_5d_avg_pct[code] = np.nan
+        else:
+            stock_5d_avg_pct[code] = np.nan
+    
+    # 构建行业5日平均涨幅
+    sector_5d_pct = {}
+    for code, ind in stock_to_industry.items():
+        pct = stock_5d_avg_pct.get(code, np.nan)
+        if not np.isnan(pct):
+            sector_5d_pct.setdefault(ind, []).append(pct)
+    
+    sector_5d_avg = {ind: np.mean(vals) for ind, vals in sector_5d_pct.items()}
+    
+    # 将行业5日平均涨幅转换为排名分（0-100）
+    if sector_5d_avg:
+        sectors = list(sector_5d_avg.keys())
+        values = list(sector_5d_avg.values())
+        ranks = pd.Series(values).rank(pct=True) * 100
+        sector_5d_score = {sectors[i]: ranks.iloc[i] for i in range(len(sectors))}
+    else:
+        sector_5d_score = {}
+    
+    # 计算当日强度得分（使用原函数）
+    today_sector = calculate_sector_strength_today(df_today)
+    if today_sector.empty:
+        return pd.DataFrame()
+    
+    # 合并：最终得分 = 0.4 * 当日强度 + 0.6 * 5日动量（归一化到0-100）
+    final_scores = []
+    for sector in today_sector.index:
+        today_score = today_sector.loc[sector, '强度得分']
+        momentum_score = sector_5d_score.get(sector, today_score)  # 若无历史则用当日分
+        weighted = 0.4 * today_score + 0.6 * momentum_score
+        final_scores.append(weighted)
+    
+    result = today_sector.copy()
+    result['强度得分（动量加权）'] = final_scores
+    result = result.sort_values('强度得分（动量加权）', ascending=False)
+    return result
+
+# ===============================
+# 原有辅助函数（保留占位）
+# ===============================
+def filter_stocks_by_rule(df):
+    if df.empty:
+        return df
+    filtered = df.copy()
+    if '名称' in filtered.columns:
+        filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
+    if '涨跌幅' in filtered.columns:
+        filtered = filtered[filtered['涨跌幅'] <= 9.5]
+    if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
+        filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
+    if not filtered.empty and '成交额' in filtered.columns:
+        threshold = max(filtered['成交额'].quantile(0.1), 2e7)
+        filtered = filtered[filtered['成交额'] > threshold]
+    return filtered
+
+def calculate_technical_indicators(hist_df):
+    return {}
+def add_technical_indicators(df, top_n=200):
+    return df
+def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=None):
+    return df
+def update_convergence(candidates_df, current_time):
+    pass
+def get_final_recommendation_from_convergence():
+    return None, []
 
 # ===============================
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 确定性增强版（大盘+容量+资金+金叉）")
+st.title("🔥 尾盘博弈 6.3 · 确定性增强版（5日板块动量）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -640,7 +688,7 @@ with st.sidebar:
     strategy_mode = st.selectbox("策略模式", ["严格模式", "标准模式", "宽松模式"], index=1, key="strategy_mode")
     st.caption("💡 严格模式确定性高 | 标准模式平衡 | 宽松模式信号多")
     st.markdown("---")
-    st.info("📌 本版本已整合大盘过滤、容量中军、资金流、金叉等增强逻辑，大幅提高确定性。")
+    st.info("📌 本版本已整合5日板块动量，能提前捕捉主线启动。")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -729,7 +777,7 @@ except Exception as e:
     df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率', '主力净流入占比'])
 
 # ===============================
-# 新增：大盘环境过滤
+# 大盘环境过滤
 # ===============================
 st.markdown("### 📊 大盘环境评估")
 market_safe, market_reason = check_market_environment(df)
@@ -741,35 +789,37 @@ if not market_safe:
 else:
     st.success(f"✅ 大盘环境符合：{market_reason}，继续选股")
 
-    # 板块分析（优化版）
-    st.markdown("### 📊 板块热度分析（主线题材）")
+    # ===============================
+    # 板块分析（使用5日动量加权）
+    # ===============================
+    st.markdown("### 📊 板块热度分析（主线题材，含5日动量）")
     if df.empty or '所属行业' not in df.columns:
         st.info("当前无有效板块数据，跳过板块分析。")
         top5_sectors = []
     else:
-        sector_stats = calculate_sector_strength(df)
-        if not sector_stats.empty:
-            top5_sectors = sector_stats.head(5).index.tolist()
-            st.success(f"🏆 今日最强主线板块 Top5: {', '.join(top5_sectors)}")
+        # 注意：需要传入历史数据缓存，这里使用st.session_state.hist_data_cache
+        sector_with_momentum = calculate_sector_momentum_5d(df, st.session_state.hist_data_cache, st.session_state.stock_industry_cache)
+        if not sector_with_momentum.empty:
+            top5_sectors = sector_with_momentum.head(5).index.tolist()
+            st.success(f"🏆 今日最强主线板块 Top5（动量加权）: {', '.join(top5_sectors)}")
             # 显示板块详情
-            st.dataframe(sector_stats[['涨跌幅', '成交额', '涨停家数', '强度得分']].head(5))
+            st.dataframe(sector_with_momentum[['涨跌幅', '成交额', '涨停家数', '强度得分（动量加权）']].head(5))
         else:
             top5_sectors = []
             st.warning("未识别主线板块，使用全市场")
 
+    # ===============================
     # 选股流程
+    # ===============================
     st.markdown("### 🎯 互补评分+增强因子选股引擎")
     if df.empty:
         st.info("当前无股票数据，无法进行选股。")
         top_candidate = None
     else:
-        # 基础过滤（ST、涨跌幅上限、炸板剔除）
         filtered = filter_stocks_by_rule(df)
         st.caption(f"基础过滤后股票数: {len(filtered)}")
         
-        # 新增：容量中军过滤（流通市值>50亿，换手率5%-15%）
         if '流通市值' in filtered.columns and '换手率' in filtered.columns:
-            # 流通市值单位为万元，50亿=500000万元
             filtered = filtered[(filtered['流通市值'] > 500000) & 
                                 (filtered['换手率'] >= 5) & 
                                 (filtered['换手率'] <= 15)]
@@ -777,7 +827,6 @@ else:
         else:
             st.warning("缺少流通市值或换手率数据，跳过容量过滤")
         
-        # 主线板块过滤
         if not top5_sectors:
             sector_filtered = filtered
             st.warning("未识别主线板块，使用全市场")
@@ -791,7 +840,6 @@ else:
             st.session_state.candidate_df = pd.DataFrame()
         else:
             MAX_CHECK = 200
-            # 预排序（按成交额和涨幅综合）
             tmp = sector_filtered.copy()
             tmp['涨跌幅_pct'] = tmp['涨跌幅'].rank(pct=True)
             tmp['成交额_pct'] = tmp['成交额'].rank(pct=True)
@@ -811,38 +859,24 @@ else:
                     progress_bar.progress((i+1)/len(to_check))
                     continue
                 
-                # 1. 量化抛压识别（剔除）
                 if has_quantum_dump_pressure(row, hist):
                     add_log("抛压剔除", f"{row['名称']} 冲高回落且放量")
                     progress_bar.progress((i+1)/len(to_check))
                     continue
                 
-                # 2. 炸板剔除（已在基础过滤中处理了最高涨幅>9.5且涨幅<7，但再确认一次）
                 if row.get('最高涨幅', 0) >= 9.5 and row['涨跌幅'] < 7:
                     add_log("炸板剔除", f"{row['名称']} 曾涨停未封死")
                     progress_bar.progress((i+1)/len(to_check))
                     continue
                 
-                # 3. 原技术形态得分（0-30）
                 tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-                
-                # 4. 综合得分（基于因子权重，与原逻辑一致）
-                # 计算各项因子的百分位排名（在全局df中排名，此处简化：在to_check中排名）
-                temp_score = row['_pre_score']  # 已经基于涨跌幅和成交额排名
-                base_score = temp_score * 70  # 0-70
-                
-                # 5. 资金流加分（主力净流入占比>2%加5分）
+                temp_score = row['_pre_score']
+                base_score = temp_score * 70
                 fund_bonus = 5 if row.get('主力净流入占比', 0) > 2 else 0
-                
-                # 6. MACD/KDJ金叉加分
                 macd_bonus = get_macd_bonus(hist)
                 kdj_bonus = get_kdj_bonus(hist)
                 gold_bonus = macd_bonus + kdj_bonus
-                
-                # 7. 尾盘分时稳定加分（涨跌幅 > -0.5% 加3分）
                 stable_bonus = 3 if row['涨跌幅'] > -0.5 else 0
-                
-                # 最终总分（上限100）
                 final_score = base_score + tech_score + fund_bonus + gold_bonus + stable_bonus
                 final_score = min(100, final_score)
                 
@@ -907,11 +941,10 @@ else:
                     display_df['最终总分'] = display_df['最终总分'].apply(lambda x: f"{x:.1f}")
                     st.dataframe(display_df, use_container_width=True)
                 
-                # 收敛记录（下午2:00-2:40）保留原逻辑
+                # 收敛记录与自动锁定（保留原机制）
                 if current_hour == 14 and current_minute < 40:
                     update_convergence(top_candidates, current_time)
                 
-                # 14:40 自动锁定最终推荐（使用收敛机制）
                 if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
                     final_rec, backups = get_final_recommendation_from_convergence()
                     if final_rec:
@@ -972,9 +1005,7 @@ else:
         st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
         st.rerun()
 
-# ===============================
 # 推荐显示区域（与原版一致）
-# ===============================
 st.markdown("---")
 st.markdown("### 📋 推荐结果")
 col_rec1, col_rec2 = st.columns(2)
