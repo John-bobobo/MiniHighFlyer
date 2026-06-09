@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 三分层并行推荐（稳健/活跃/弹性）
+尾盘博弈 6.3 · 三分层并行推荐（稳健/活跃/弹性）[修复版]
 ===================================================
 ✅ 核心逻辑：
    - 大盘环境过滤
@@ -33,13 +33,13 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 三分层并行推荐", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 三分层并行推荐（修复）", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token（请填写你自己的）
 # ===============================
 try:
-    TUSHARE_TOKEN = "71ec08895d2adb35b44f287cac1c377b271a342dee08a7fd721826fe"
+    TUSHARE_TOKEN = "6ab0755682f76973b447c5339bb6e618271bd41752b9f1b1b0890013"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -752,8 +752,6 @@ market_safe, market_reason = check_market_environment(df)
 if not market_safe:
     st.error(f"⚠️ 大盘环境不满足开仓条件：{market_reason}")
     st.warning("今日强烈建议 **空仓**，停止选股。")
-    # 清空所有推荐
-    st.session_state.candidate_df = pd.DataFrame()
     st.stop()
 else:
     st.success(f"✅ 大盘环境符合：{market_reason}，继续选股")
@@ -799,6 +797,12 @@ else:
             st.warning("基础股票池为空，今日无任何推荐，建议空仓")
             st.stop()
         
+        # ===== 修复点：为 base_pool 添加 _pre_score 列（基于百分位排名）=====
+        base_pool = base_pool.copy()
+        base_pool['涨跌幅_pct'] = base_pool['涨跌幅'].rank(pct=True)
+        base_pool['成交额_pct'] = base_pool['成交额'].rank(pct=True)
+        base_pool['_pre_score'] = (base_pool['涨跌幅_pct'] + base_pool['成交额_pct']) / 2
+        
         # 定义三个层级的阈值（市值单位：亿，成交额单位：亿）
         layers = {
             "稳健中军": {"min_cap": 200, "max_cap": None, "min_turn": 1.0, "max_turn": 8.0, "min_amount": 5.0},
@@ -823,6 +827,7 @@ else:
             status_text.text(f"预计算评分 {i+1}/{total_stocks}: {row['名称']}")
             hist = get_historical_data(row['代码'])
             if hist.empty:
+                stock_score_cache[row['代码']] = {"valid": False}
                 progress_bar.progress((i+1)/total_stocks)
                 continue
             # 抛压和炸板剔除（如果不符合，直接标记为不可用）
@@ -835,9 +840,9 @@ else:
                 progress_bar.progress((i+1)/total_stocks)
                 continue
             
-            # 计算各项得分
+            # 计算各项得分（使用已存在的 _pre_score）
             tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-            temp_score = row['_pre_score'] if '_pre_score' in row else (row['涨跌幅'].rank(pct=True) + row['成交额'].rank(pct=True)) / 2
+            temp_score = row['_pre_score']  # 已预先计算好的综合排名分
             base_score = temp_score * 70
             fund_bonus = 5 if row.get('主力净流入占比', 0) > 2 else 0
             macd_bonus = get_macd_bonus(hist)
@@ -910,8 +915,9 @@ else:
                 all_layer_results[layer_name] = pd.DataFrame()
         
         # 显示结果
-        if all_layer_results:
+        if any(not df.empty for df in all_layer_results.values()):
             for layer_name, df_layer in all_layer_results.items():
+                cfg = layers[layer_name]
                 st.markdown(f"#### 🏆 {layer_name} 推荐（市值{'{}'.format(cfg['min_cap']) if cfg['max_cap'] else '>'+str(cfg['min_cap'])}亿，换手{cfg['min_turn']}-{cfg['max_turn']}%，成交额>{cfg['min_amount']}亿）")
                 if df_layer.empty:
                     st.info(f"{layer_name} 无符合条件的股票")
@@ -923,17 +929,13 @@ else:
                     display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.1f}")
                     display_df['最终总分'] = display_df['最终总分'].apply(lambda x: f"{x:.1f}")
                     st.dataframe(display_df, use_container_width=True)
-                    # 可选：显示更多详情（资金流、金叉等）
+                    # 可选：显示更多详情
                     with st.expander(f"查看{layer_name}详情"):
                         st.dataframe(df_layer[['名称', '代码', '涨跌幅', '换手率', '主力净流入占比', '资金流分', '金叉加分', '稳定分', '最终总分']].head())
         else:
             st.warning("所有层级均无候选股票，今日建议空仓")
-        
-        # 可选：将三个层级的推荐合并存储到 session 中，供手动选择（可选）
-        # 这里为简化，不处理自动锁定，由用户自行决定
 
-# 自动推荐和手动选择功能保持原有框架，但因三并行推荐逻辑复杂，暂时禁用自动锁定（用户自行判断）
-# 保留手动选择（如果用户想手动从某个层级选股，可以后续扩展，但本版暂不实现自动推荐）
+# 提示信息
 st.info("💡 本版本同时显示三个层级的推荐，请自行对比选择买入标的。自动锁定功能已暂时关闭。")
 
 # 系统日志
@@ -951,7 +953,7 @@ with st.expander("📜 系统日志", expanded=False):
     else:
         st.info("暂无日志记录")
 
-# 自动刷新（交易时段每30秒）
+# 自动刷新
 if is_trading:
     refresh_time = 30
     st.write(f"⏳ {refresh_time}秒后自动刷新数据...")
