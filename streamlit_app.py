@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 确定性增强版（5日板块动量 + 动态分层中军）
+尾盘博弈 6.3 · 确定性增强版（5日板块动量 + 动态分层中军 + 阈值放宽）
 ===================================================
-✅ 核心逻辑（与之前一致，仅将固定市值/换手改为动态分层）：
+✅ 核心逻辑：
    - 大盘环境过滤
-   - 动态容量中军过滤：根据板块强度自动选择【稳健中军/活跃中军/弹性先锋】
+   - 动态容量中军过滤：根据板块强度自动选择【稳健中军/活跃中军/弹性先锋】（阈值已放宽）
    - 量化抛压识别 + 炸板剔除
    - 主线板块过滤：使用【当日强度(40%) + 5日动量强度(60%)】加权得分，取前5强行业
    - 对候选股票计算：综合得分+技术形态得分+资金流加分+MACD/KDJ金叉加分+尾盘稳定加分
@@ -31,13 +31,13 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 确定性增强版（动态分层）", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 确定性增强版（动态分层·放宽）", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "7d3311f6c93fcf0d47729a1786891f1857ff5a36016ac1b3948fcfb0"
+    TUSHARE_TOKEN = "ccd2a378923583745c078936c1d7e50505aa46c3e0b2da421fffaef8"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -524,29 +524,28 @@ def calculate_sector_momentum_5d_optimized(df_today):
     return result
 
 # ===============================
-# 🆕 动态容量中军阈值（根据板块强度分层）
+# 动态容量中军阈值（根据板块强度分层，阈值已放宽）
 # ===============================
 def get_dynamic_cap_thresholds(sector_with_momentum):
     """
-    根据板块动量加权强度自动选择中军层级
+    根据板块动量加权强度自动选择中军层级（阈值已放宽，减少空仓）
     返回: (策略名称, 最小市值(亿), 最大市值(亿), 最小换手率(%), 最大换手率(%), 最小成交额(亿元))
     """
     if sector_with_momentum.empty:
-        # 无主线板块，使用稳健中军
-        return "稳健中军", 200, None, 1.0, 8.0, 10.0
+        # 无主线板块，使用稳健中军（成交额放宽至5亿）
+        return "稳健中军", 200, None, 1.0, 8.0, 5.0
     
-    # 取最强板块的强度得分
     top_strength = sector_with_momentum.iloc[0]['强度得分（动量加权）']
     
     if top_strength >= 80:
-        # 情绪火爆，使用弹性先锋
-        return "弹性先锋", 30, 50, 5.0, 20.0, 2.0
+        # 情绪火爆 → 弹性先锋：换手率下限3%，成交额下限1亿，市值30-50亿
+        return "弹性先锋", 30, 50, 3.0, 20.0, 1.0
     elif top_strength >= 50:
-        # 情绪正常，使用活跃中军
-        return "活跃中军", 50, 200, 2.0, 12.0, 5.0
+        # 情绪正常 → 活跃中军：换手率下限2%，成交额下限3亿，市值50-200亿
+        return "活跃中军", 50, 200, 2.0, 12.0, 3.0
     else:
-        # 情绪偏弱，使用稳健中军
-        return "稳健中军", 200, None, 1.0, 8.0, 10.0
+        # 情绪偏弱 → 稳健中军：换手率1-8%，成交额下限5亿，市值>200亿
+        return "稳健中军", 200, None, 1.0, 8.0, 5.0
 
 # ===============================
 # 原有辅助函数（保留占位）
@@ -581,7 +580,7 @@ def get_final_recommendation_from_convergence():
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 确定性增强版（动态分层中军）")
+st.title("🔥 尾盘博弈 6.3 · 确定性增强版（动态分层·阈值放宽）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -679,7 +678,7 @@ with st.sidebar:
     strategy_mode = st.selectbox("策略模式", ["严格模式", "标准模式", "宽松模式"], index=1, key="strategy_mode")
     st.caption("💡 严格模式确定性高 | 标准模式平衡 | 宽松模式信号多")
     st.markdown("---")
-    st.info("📌 本版本已整合5日板块动量 + 动态分层中军（稳健/活跃/弹性）")
+    st.info("📌 本版本已整合5日板块动量 + 动态分层中军（阈值已放宽，减少空仓）")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -809,12 +808,11 @@ else:
         filtered = filter_stocks_by_rule(df)
         st.caption(f"基础过滤后股票数: {len(filtered)}")
         
-        # 🆕 动态获取容量中军阈值
+        # 动态获取容量中军阈值
         if not sector_with_momentum.empty:
             strat_name, min_cap, max_cap, min_turn, max_turn, min_amount = get_dynamic_cap_thresholds(sector_with_momentum)
         else:
-            # 无板块数据时使用稳健中军
-            strat_name, min_cap, max_cap, min_turn, max_turn, min_amount = "稳健中军", 200, None, 1.0, 8.0, 10.0
+            strat_name, min_cap, max_cap, min_turn, max_turn, min_amount = "稳健中军", 200, None, 1.0, 8.0, 5.0
         
         st.caption(f"动态容量中军策略: **{strat_name}** | 市值: {min_cap}{'-'+str(max_cap) if max_cap else '+'}亿, 换手: {min_turn}-{max_turn}%, 成交额: >{min_amount}亿")
         
