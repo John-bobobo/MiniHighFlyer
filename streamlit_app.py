@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 确定性增强版（5日板块动量 + 动态分层中军 + 阈值放宽）
+尾盘博弈 6.3 · 三分层并行推荐（稳健/活跃/弹性）
 ===================================================
 ✅ 核心逻辑：
    - 大盘环境过滤
-   - 动态容量中军过滤：根据板块强度自动选择【稳健中军/活跃中军/弹性先锋】（阈值已放宽）
-   - 量化抛压识别 + 炸板剔除
-   - 主线板块过滤：使用【当日强度(40%) + 5日动量强度(60%)】加权得分，取前5强行业
-   - 对候选股票计算：综合得分+技术形态得分+资金流加分+MACD/KDJ金叉加分+尾盘稳定加分
-   - 每日推荐3-5只，按总分排序
-✅ 性能优化：板块动量计算仅取成交额前100只股票，避免超时
+   - 主线板块过滤（5日动量加权）
+   - 同时输出三个容量中军层级的推荐：
+       ① 稳健中军：市值>200亿，换手1%-8%，成交额>5亿
+       ② 活跃中军：市值50-200亿，换手2%-12%，成交额>3亿
+       ③ 弹性先锋：市值30-50亿，换手3%-20%，成交额>1亿
+   - 每个层级独立评分（综合得分+技术形态+资金流+金叉+尾盘稳定）
+   - 每日每个层级推荐3-5只，按总分排序
+✅ 用户自行选择买入层级，空仓信号仍保留
 """
 import sys
 import streamlit as st
@@ -31,13 +33,13 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 确定性增强版（动态分层·放宽）", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 三分层并行推荐", layout="wide")
 
 # ===============================
-# 🔑 Tushare Token
+# 🔑 Tushare Token（请填写你自己的）
 # ===============================
 try:
-    TUSHARE_TOKEN = "ccd2a378923583745c078936c1d7e50505aa46c3e0b2da421fffaef8"
+    TUSHARE_TOKEN = "71ec08895d2adb35b44f287cac1c377b271a342dee08a7fd721826fe"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
@@ -524,30 +526,6 @@ def calculate_sector_momentum_5d_optimized(df_today):
     return result
 
 # ===============================
-# 动态容量中军阈值（根据板块强度分层，阈值已放宽）
-# ===============================
-def get_dynamic_cap_thresholds(sector_with_momentum):
-    """
-    根据板块动量加权强度自动选择中军层级（阈值已放宽，减少空仓）
-    返回: (策略名称, 最小市值(亿), 最大市值(亿), 最小换手率(%), 最大换手率(%), 最小成交额(亿元))
-    """
-    if sector_with_momentum.empty:
-        # 无主线板块，使用稳健中军（成交额放宽至5亿）
-        return "稳健中军", 200, None, 1.0, 8.0, 5.0
-    
-    top_strength = sector_with_momentum.iloc[0]['强度得分（动量加权）']
-    
-    if top_strength >= 80:
-        # 情绪火爆 → 弹性先锋：换手率下限3%，成交额下限1亿，市值30-50亿
-        return "弹性先锋", 30, 50, 3.0, 20.0, 1.0
-    elif top_strength >= 50:
-        # 情绪正常 → 活跃中军：换手率下限2%，成交额下限3亿，市值50-200亿
-        return "活跃中军", 50, 200, 2.0, 12.0, 3.0
-    else:
-        # 情绪偏弱 → 稳健中军：换手率1-8%，成交额下限5亿，市值>200亿
-        return "稳健中军", 200, None, 1.0, 8.0, 5.0
-
-# ===============================
 # 原有辅助函数（保留占位）
 # ===============================
 def filter_stocks_by_rule(df):
@@ -580,7 +558,7 @@ def get_final_recommendation_from_convergence():
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 确定性增强版（动态分层·阈值放宽）")
+st.title("🔥 尾盘博弈 6.3 · 三分层并行推荐（稳健/活跃/弹性）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -678,7 +656,7 @@ with st.sidebar:
     strategy_mode = st.selectbox("策略模式", ["严格模式", "标准模式", "宽松模式"], index=1, key="strategy_mode")
     st.caption("💡 严格模式确定性高 | 标准模式平衡 | 宽松模式信号多")
     st.markdown("---")
-    st.info("📌 本版本已整合5日板块动量 + 动态分层中军（阈值已放宽，减少空仓）")
+    st.info("📌 本版本同时输出三个容量层级推荐，请自行选择买入层级。")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -774,8 +752,9 @@ market_safe, market_reason = check_market_environment(df)
 if not market_safe:
     st.error(f"⚠️ 大盘环境不满足开仓条件：{market_reason}")
     st.warning("今日强烈建议 **空仓**，停止选股。")
-    top_candidate = None
+    # 清空所有推荐
     st.session_state.candidate_df = pd.DataFrame()
+    st.stop()
 else:
     st.success(f"✅ 大盘环境符合：{market_reason}，继续选股")
 
@@ -798,318 +777,164 @@ else:
             st.warning("未识别主线板块，使用全市场")
 
     # ===============================
-    # 选股流程
+    # 选股流程 - 三个分层并行
     # ===============================
-    st.markdown("### 🎯 互补评分+增强因子选股引擎")
+    st.markdown("### 🎯 三分层并行推荐（稳健 / 活跃 / 弹性）")
     if df.empty:
         st.info("当前无股票数据，无法进行选股。")
-        top_candidate = None
     else:
+        # 基础过滤（ST、涨跌幅上限、炸板剔除、成交额下限）
         filtered = filter_stocks_by_rule(df)
         st.caption(f"基础过滤后股票数: {len(filtered)}")
         
-        # 动态获取容量中军阈值
-        if not sector_with_momentum.empty:
-            strat_name, min_cap, max_cap, min_turn, max_turn, min_amount = get_dynamic_cap_thresholds(sector_with_momentum)
+        # 如果没有主线板块，则使用全市场；否则只取主线板块内的股票
+        if top5_sectors:
+            base_pool = filtered[filtered['所属行业'].isin(top5_sectors)]
+            st.caption(f"主线板块过滤后股票数: {len(base_pool)}")
         else:
-            strat_name, min_cap, max_cap, min_turn, max_turn, min_amount = "稳健中军", 200, None, 1.0, 8.0, 5.0
+            base_pool = filtered.copy()
+            st.caption("未识别主线板块，使用全市场选股")
         
-        st.caption(f"动态容量中军策略: **{strat_name}** | 市值: {min_cap}{'-'+str(max_cap) if max_cap else '+'}亿, 换手: {min_turn}-{max_turn}%, 成交额: >{min_amount}亿")
+        if base_pool.empty:
+            st.warning("基础股票池为空，今日无任何推荐，建议空仓")
+            st.stop()
         
-        # 构建过滤条件（注意单位：流通市值是万元）
-        if '流通市值' in filtered.columns and '换手率' in filtered.columns:
-            cond = (filtered['流通市值'] > min_cap * 1e4)
-            if max_cap:
-                cond &= (filtered['流通市值'] <= max_cap * 1e4)
-            cond &= (filtered['换手率'] >= min_turn) & (filtered['换手率'] <= max_turn)
-            cond &= (filtered['成交额'] > min_amount * 1e8)
-            filtered = filtered[cond]
-            st.caption(f"容量中军过滤后股票数: {len(filtered)}只")
-        else:
-            st.warning("缺少流通市值或换手率数据，跳过容量过滤")
+        # 定义三个层级的阈值（市值单位：亿，成交额单位：亿）
+        layers = {
+            "稳健中军": {"min_cap": 200, "max_cap": None, "min_turn": 1.0, "max_turn": 8.0, "min_amount": 5.0},
+            "活跃中军": {"min_cap": 50,  "max_cap": 200,   "min_turn": 2.0, "max_turn": 12.0, "min_amount": 3.0},
+            "弹性先锋": {"min_cap": 30,  "max_cap": 50,    "min_turn": 3.0, "max_turn": 20.0, "min_amount": 1.0}
+        }
         
-        if not top5_sectors:
-            sector_filtered = filtered
-            st.warning("未识别主线板块，使用全市场")
-        else:
-            sector_filtered = filtered[filtered['所属行业'].isin(top5_sectors)]
-            st.caption(f"主线板块过滤后股票数: {len(sector_filtered)}")
+        # 对每个层级分别筛选并评分
+        all_layer_results = {}
         
-        if sector_filtered.empty:
-            st.warning("主线板块内无股票，今日建议空仓")
-            top_candidate = None
-            st.session_state.candidate_df = pd.DataFrame()
-        else:
-            MAX_CHECK = 200
-            tmp = sector_filtered.copy()
-            tmp['涨跌幅_pct'] = tmp['涨跌幅'].rank(pct=True)
-            tmp['成交额_pct'] = tmp['成交额'].rank(pct=True)
-            tmp['_pre_score'] = (tmp['涨跌幅_pct'] + tmp['成交额_pct']) / 2
-            tmp = tmp.sort_values('_pre_score', ascending=False)
-            to_check = tmp.head(MAX_CHECK)
-            st.caption(f"将对前 {len(to_check)} 只潜力股进行深度评分...")
+        # 为了避免重复计算每只股票的技术分、金叉分等，我们先对 base_pool 中的所有股票计算一次评分（耗时操作）
+        # 然后将评分结果存储到字典中，供各层级复用
+        st.info("正在计算所有候选股票的技术评分（一次性）...")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # 用于存储每只股票的评分信息
+        stock_score_cache = {}  # key: 代码, value: dict of scores
+        
+        total_stocks = len(base_pool)
+        for i, (idx, row) in enumerate(base_pool.iterrows()):
+            status_text.text(f"预计算评分 {i+1}/{total_stocks}: {row['名称']}")
+            hist = get_historical_data(row['代码'])
+            if hist.empty:
+                progress_bar.progress((i+1)/total_stocks)
+                continue
+            # 抛压和炸板剔除（如果不符合，直接标记为不可用）
+            if has_quantum_dump_pressure(row, hist):
+                stock_score_cache[row['代码']] = {"valid": False}
+                progress_bar.progress((i+1)/total_stocks)
+                continue
+            if row.get('最高涨幅', 0) >= 9.5 and row['涨跌幅'] < 7:
+                stock_score_cache[row['代码']] = {"valid": False}
+                progress_bar.progress((i+1)/total_stocks)
+                continue
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            candidates_with_scores = []
+            # 计算各项得分
+            tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
+            temp_score = row['_pre_score'] if '_pre_score' in row else (row['涨跌幅'].rank(pct=True) + row['成交额'].rank(pct=True)) / 2
+            base_score = temp_score * 70
+            fund_bonus = 5 if row.get('主力净流入占比', 0) > 2 else 0
+            macd_bonus = get_macd_bonus(hist)
+            kdj_bonus = get_kdj_bonus(hist)
+            gold_bonus = macd_bonus + kdj_bonus
+            stable_bonus = 3 if row['涨跌幅'] > -0.5 else 0
+            final_score = base_score + tech_score + fund_bonus + gold_bonus + stable_bonus
+            final_score = min(100, final_score)
             
-            for i, (idx, row) in enumerate(to_check.iterrows()):
-                status_text.text(f"正在分析 {i+1}/{len(to_check)}: {row['名称']}")
-                hist = get_historical_data(row['代码'])
-                if hist.empty:
-                    progress_bar.progress((i+1)/len(to_check))
+            stock_score_cache[row['代码']] = {
+                "valid": True,
+                "row": row,
+                "final_score": final_score,
+                "tech_score": tech_score,
+                "base_score": base_score,
+                "fund_bonus": fund_bonus,
+                "gold_bonus": gold_bonus,
+                "stable_bonus": stable_bonus
+            }
+            progress_bar.progress((i+1)/total_stocks)
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        # 对每个层级进行筛选和排序
+        for layer_name, cfg in layers.items():
+            candidates = []
+            for code, cache in stock_score_cache.items():
+                if not cache["valid"]:
                     continue
-                
-                if has_quantum_dump_pressure(row, hist):
-                    progress_bar.progress((i+1)/len(to_check))
+                row = cache["row"]
+                # 应用层级过滤条件
+                circ_mv = row['流通市值']  # 单位万元
+                turnover = row['换手率']
+                amount = row['成交额']
+                # 市值条件
+                if cfg["min_cap"] and circ_mv < cfg["min_cap"] * 1e4:
                     continue
-                
-                if row.get('最高涨幅', 0) >= 9.5 and row['涨跌幅'] < 7:
-                    progress_bar.progress((i+1)/len(to_check))
+                if cfg["max_cap"] and circ_mv > cfg["max_cap"] * 1e4:
                     continue
-                
-                tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-                temp_score = row['_pre_score']
-                base_score = temp_score * 70
-                fund_bonus = 5 if row.get('主力净流入占比', 0) > 2 else 0
-                macd_bonus = get_macd_bonus(hist)
-                kdj_bonus = get_kdj_bonus(hist)
-                gold_bonus = macd_bonus + kdj_bonus
-                stable_bonus = 3 if row['涨跌幅'] > -0.5 else 0
-                final_score = base_score + tech_score + fund_bonus + gold_bonus + stable_bonus
-                final_score = min(100, final_score)
-                
-                candidates_with_scores.append({
+                # 换手率条件
+                if turnover < cfg["min_turn"] or turnover > cfg["max_turn"]:
+                    continue
+                # 成交额条件
+                if amount < cfg["min_amount"] * 1e8:
+                    continue
+                # 通过所有条件
+                candidates.append({
                     '代码': row['代码'],
                     '名称': row['名称'],
                     '涨跌幅': row['涨跌幅'],
                     '成交额': row['成交额'],
                     '最新价': row['最新价'],
-                    '技术得分': tech_score,
-                    '综合得分': base_score,
-                    '资金流分': fund_bonus,
-                    '金叉加分': gold_bonus,
-                    '稳定分': stable_bonus,
-                    '最终总分': final_score,
+                    '技术得分': cache["tech_score"],
+                    '综合得分': cache["base_score"],
+                    '资金流分': cache["fund_bonus"],
+                    '金叉加分': cache["gold_bonus"],
+                    '稳定分': cache["stable_bonus"],
+                    '最终总分': cache["final_score"],
                     '所属行业': row['所属行业'],
                     '换手率': row.get('换手率', 0),
                     '流通市值': row.get('流通市值', 0),
                     '主力净流入占比': row.get('主力净流入占比', 0)
                 })
-                progress_bar.progress((i+1)/len(to_check))
-            
-            progress_bar.empty()
-            status_text.empty()
-            
-            if not candidates_with_scores:
-                st.warning("未获取到任何候选股票，今日建议空仓")
-                top_candidate = None
-                st.session_state.candidate_df = pd.DataFrame()
+            if candidates:
+                df_layer = pd.DataFrame(candidates)
+                df_layer = df_layer.sort_values('最终总分', ascending=False)
+                all_layer_results[layer_name] = df_layer.head(5)  # 每个层级取前5
             else:
-                scored_df = pd.DataFrame(candidates_with_scores)
-                scored_df = scored_df.sort_values('最终总分', ascending=False)
-                top_candidates = scored_df.head(10)
-                top_candidate = top_candidates.iloc[0].to_dict() if not top_candidates.empty else None
-                st.session_state.candidate_df = top_candidates.copy()
-                
-                st.markdown("#### 📈 优选股票综合分析")
-                if top_candidate:
-                    col_info, col_factors = st.columns([1, 2])
-                    with col_info:
-                        st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
-                        st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
-                        st.metric("**最终总分**", f"{top_candidate.get('最终总分', 0):.2f}")
-                        st.metric("**技术得分**", f"{top_candidate.get('技术得分', 0):.2f}/30")
-                        st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.2f}/70")
-                        if '涨跌幅' in top_candidate:
-                            st.metric("**今日涨幅**", f"{top_candidate['涨跌幅']:.2f}%")
-                        st.metric("**主力净流入占比**", f"{top_candidate.get('主力净流入占比', 0):.2f}%")
-                    with col_factors:
-                        st.write("增强因子加分情况")
-                        st.write(f"- 资金流加分: +{top_candidate.get('资金流分', 0)}")
-                        st.write(f"- MACD/KDJ金叉加分: +{top_candidate.get('金叉加分', 0)}")
-                        st.write(f"- 尾盘稳定加分: +{top_candidate.get('稳定分', 0)}")
-                
-                st.markdown("#### 🏆 候选股票排名 (按最终总分前5)")
-                if not top_candidates.empty:
-                    display_df = top_candidates[['名称', '代码', '涨跌幅', '成交额', '技术得分', '综合得分', '资金流分', '金叉加分', '最终总分']].head().copy()
+                all_layer_results[layer_name] = pd.DataFrame()
+        
+        # 显示结果
+        if all_layer_results:
+            for layer_name, df_layer in all_layer_results.items():
+                st.markdown(f"#### 🏆 {layer_name} 推荐（市值{'{}'.format(cfg['min_cap']) if cfg['max_cap'] else '>'+str(cfg['min_cap'])}亿，换手{cfg['min_turn']}-{cfg['max_turn']}%，成交额>{cfg['min_amount']}亿）")
+                if df_layer.empty:
+                    st.info(f"{layer_name} 无符合条件的股票")
+                else:
+                    display_df = df_layer[['名称', '代码', '涨跌幅', '成交额', '技术得分', '综合得分', '资金流分', '金叉加分', '最终总分']].head().copy()
                     display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
                     display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
                     display_df['技术得分'] = display_df['技术得分'].apply(lambda x: f"{x:.1f}")
                     display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.1f}")
                     display_df['最终总分'] = display_df['最终总分'].apply(lambda x: f"{x:.1f}")
                     st.dataframe(display_df, use_container_width=True)
-                
-                if current_hour == 14 and current_minute < 40:
-                    update_convergence(top_candidates, current_time)
-                
-                if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
-                    final_rec, backups = get_final_recommendation_from_convergence()
-                    if final_rec:
-                        stock_info = scored_df[scored_df['代码'] == final_rec['代码']].iloc[0].to_dict()
-                        st.session_state.final_pick = {
-                            'name': stock_info.get('名称', final_rec['名称']),
-                            'code': final_rec['代码'],
-                            '涨跌幅': float(stock_info.get('涨跌幅', 0)),
-                            '成交额': float(stock_info.get('成交额', 0)),
-                            'time': current_time_str,
-                            'auto': True,
-                            'final_score': float(stock_info.get('最终总分', 0)),
-                            'sector': ', '.join(top5_sectors),
-                            'data_source': st.session_state.data_source
-                        }
-                        st.session_state.locked = True
-                        st.session_state.backup_picks = []
-                        for b in backups:
-                            b_info = scored_df[scored_df['代码'] == b['代码']].iloc[0].to_dict()
-                            st.session_state.backup_picks.append({
-                                'name': b_info.get('名称', b['名称']),
-                                'code': b['代码'],
-                                '涨跌幅': float(b_info.get('涨跌幅', 0)),
-                            })
-                        add_log("自动推荐", f"收敛锁定最终推荐: {final_rec['名称']}")
-                        st.rerun()
-                
-                st.session_state.test_top_stock = {
-                    'name': top_candidate.get('名称', ''),
-                    'code': top_candidate.get('代码', ''),
-                    '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
-                    '成交额': float(top_candidate.get('成交额', 0)),
-                    '最终总分': float(top_candidate.get('最终总分', 0)),
-                    'time': current_time_str,
-                    'sector': ', '.join(top5_sectors) if top5_sectors else '全市场',
-                    'data_source': st.session_state.data_source
-                }
-
-# 自动推荐（首次推荐13:30-14:00）
-st.markdown("### 🤖 自动推荐系统")
-use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
-if not use_real_data:
-    st.info("⏸️ 当前非交易时间或无实时数据，自动推荐已暂停")
-else:
-    if is_first_rec_time and st.session_state.morning_pick is None and top_candidate is not None:
-        st.session_state.morning_pick = {
-            'name': top_candidate.get('名称', ''),
-            'code': top_candidate.get('代码', ''),
-            '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
-            '成交额': float(top_candidate.get('成交额', 0)),
-            'time': current_time_str,
-            'auto': True,
-            'final_score': float(top_candidate.get('最终总分', 0)),
-            'sector': top_candidate.get('所属行业', '主线板块'),
-            'data_source': st.session_state.data_source
-        }
-        add_log("自动推荐", f"生成首次推荐: {top_candidate.get('名称', '')}")
-        st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
-        st.rerun()
-
-# ===============================
-# 推荐显示区域
-# ===============================
-st.markdown("---")
-st.markdown("### 📋 推荐结果")
-col_rec1, col_rec2 = st.columns(2)
-with col_rec1:
-    st.subheader("🕐 首次推荐 (13:30-14:00)")
-    if st.session_state.morning_pick is not None:
-        pick = st.session_state.morning_pick
-        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
-        st.markdown(f"""
-        <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
-            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
-            <p><strong>📅 推荐时间:</strong> {pick['time']}</p>
-            <p><strong>📈 当前涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
-            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
-            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
-            <p><strong>🔧 来源:</strong> {'自动生成' if pick.get('auto', False) else '手动设置'}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        if pick['涨跌幅'] > 6:
-            st.warning("📝 **操作建议**: 涨幅较大，建议观望或轻仓参与")
-        elif pick.get('涨跌幅', 0) < 0:
-            st.info("📝 **操作建议**: 当前下跌，观察是否有反弹机会")
+                    # 可选：显示更多详情（资金流、金叉等）
+                    with st.expander(f"查看{layer_name}详情"):
+                        st.dataframe(df_layer[['名称', '代码', '涨跌幅', '换手率', '主力净流入占比', '资金流分', '金叉加分', '稳定分', '最终总分']].head())
         else:
-            st.success("📝 **操作建议**: 可考虑逢低关注")
-    else:
-        if is_first_rec_time:
-            if use_real_data and top_candidate is not None:
-                st.info("⏳ 正在自动生成首次推荐...")
-            else:
-                st.info("⏸️ 等待真实数据或合适标的")
-        else:
-            st.info("⏰ 首次推荐时段: 13:30-14:00")
+            st.warning("所有层级均无候选股票，今日建议空仓")
+        
+        # 可选：将三个层级的推荐合并存储到 session 中，供手动选择（可选）
+        # 这里为简化，不处理自动锁定，由用户自行决定
 
-with col_rec2:
-    st.subheader("🎯 最终锁定 (14:40后)")
-    if st.session_state.final_pick is not None:
-        pick = st.session_state.final_pick
-        data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
-        st.markdown(f"""
-        <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
-            <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
-            <p><strong>📅 锁定时间:</strong> {pick['time']}</p>
-            <p><strong>📈 锁定涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
-            <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
-            <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
-            <p><strong>🔒 状态:</strong> {'已锁定' if st.session_state.locked else '未锁定'}</p>
-            <p><strong>🔧 来源:</strong> {'自动锁定' if pick.get('auto', False) else '手动设置'}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.session_state.backup_picks:
-            st.markdown("#### 🥈 备选推荐")
-            for i, b in enumerate(st.session_state.backup_picks, 1):
-                st.write(f"{i}. {b['name']} ({b['code']}) 涨幅 {b['涨跌幅']:.2f}%")
-        st.markdown("#### 📋 明日操作计划")
-        if pick['涨跌幅'] < 0:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "10-20%", "低仓位")
-            with col_b:
-                st.metric("止损位", "-3%", "严格止损")
-        elif pick['涨跌幅'] < 3:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "20-30%", "适中仓位")
-            with col_b:
-                st.metric("止损位", "-2%", "正常止损")
-        else:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("建议仓位", "15-25%", "谨慎参与")
-            with col_b:
-                st.metric("止损位", "-2.5%", "适度止损")
-        st.info("💡 **提示**: 建议次日开盘观察10-30分钟再决定是否介入")
-    else:
-        if is_final_lock_time:
-            if use_real_data and top_candidate is not None:
-                st.info("⏳ 正在收敛计算最终推荐...")
-            else:
-                st.info("⏸️ 等待真实数据或合适标的")
-        else:
-            st.info("⏰ 最终锁定时段: 14:40后")
-
-# 手动选择
-if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
-    st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
-    manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
-    selected = st.selectbox("从候选池中手动选择一只股票:", list(manual_options.keys()))
-    if st.button("✅ 设为首选（覆盖最终推荐）"):
-        idx = manual_options[selected]
-        row = st.session_state.candidate_df.iloc[idx]
-        st.session_state.final_pick = {
-            'name': row['名称'],
-            'code': row['代码'],
-            '涨跌幅': row['涨跌幅'],
-            '成交额': row['成交额'],
-            'time': current_time_str,
-            'auto': False,
-            'final_score': row['最终总分']
-        }
-        st.session_state.final_locked = True
-        add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
-        st.rerun()
+# 自动推荐和手动选择功能保持原有框架，但因三并行推荐逻辑复杂，暂时禁用自动锁定（用户自行判断）
+# 保留手动选择（如果用户想手动从某个层级选股，可以后续扩展，但本版暂不实现自动推荐）
+st.info("💡 本版本同时显示三个层级的推荐，请自行对比选择买入标的。自动锁定功能已暂时关闭。")
 
 # 系统日志
 with st.expander("📜 系统日志", expanded=False):
@@ -1126,7 +951,7 @@ with st.expander("📜 系统日志", expanded=False):
     else:
         st.info("暂无日志记录")
 
-# 自动刷新
+# 自动刷新（交易时段每30秒）
 if is_trading:
     refresh_time = 30
     st.write(f"⏳ {refresh_time}秒后自动刷新数据...")
