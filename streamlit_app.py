@@ -1,20 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-尾盘博弈 6.3 · 主线题材 + 互补评分模式（增强版）
-===================================================
-✅ 核心逻辑（在原版基础上增加）：
-   - 基础过滤 + 主线板块过滤（使用【当日强度(40%) + 5日动量强度(60%)】加权）
-   - 量化抛压识别 + 炸板剔除
-   - 主力资金净流入加分（净流入占比>2% → +5分）
-   - MACD/KDJ金叉加分（零轴下金叉+5，零轴上+3，KDJ低位+5）
-   - 对前200只潜力股计算：
-       ① 原有综合得分（0-70分）
-       ② 技术形态得分（0-30分）
-       ③ 资金流加分（0-5分）
-       ④ 金叉加分（0-10分）
-       最终总分 = ①+②+③+④
-   - 每日推荐3-5只，按总分排序
-✅ 优点：大幅提升确定性，减少假信号
+尾盘博弈 6.3 · 孕线突破增强版（大盘风险提示不拦截）
+========================================================
+✅ 核心逻辑：
+   - 寻找最近形成的“母线（放量大阳线）+ 子线（小阴/十字）”孕线组合
+   - 母线需满足：近20日最大涨幅 或 近20日最大成交量（标志性K线）
+   - 突破确认：今日放量（>1.5倍5日均量）且价格有效突破母线最高价
+   - 额外过滤：
+       ① 大盘环境：若上证跌幅<-1%，给出红色预警，但**不拦截**选股
+       ② 相对位置：当前股价偏离120日均线不超过30%（防止高位接盘）
+   - 每日推荐3-5只，按综合得分排序，并在UI醒目提示风险
+✅ 优点：大幅提高信号质量，过滤诱多陷阱，同时保留极端行情下的机会
 """
 import sys
 import streamlit as st
@@ -36,7 +32,7 @@ import warnings
 import tushare as ts
 
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="尾盘博弈 6.3 · 互补评分增强版", layout="wide")
+st.set_page_config(page_title="尾盘博弈 6.3 · 孕线突破增强版", layout="wide")
 
 # ===============================
 # 🔑 Tushare Token
@@ -81,9 +77,9 @@ default_session_vars = {
     "backup_picks": [],
     "candidate_df": pd.DataFrame(),
     "final_locked": False,
-    # 新增缓存
     "stock_basic_cache": {},
     "moneyflow_cache": {},
+    "index_cache": {},          # 指数数据缓存
 }
 
 for key, default in default_session_vars.items():
@@ -115,7 +111,36 @@ def is_trading_day_and_time(now=None):
     return False, "非交易时间"
 
 # ===============================
-# 获取流通市值、换手率（用于计算量比，但原版已有效，新增用于资金流）
+# 【新增】获取大盘指数涨跌幅（用于环境过滤，仅提示不拦截）
+# ===============================
+def get_index_change(trade_date=None):
+    """获取上证指数当日涨跌幅，若获取失败返回None"""
+    if trade_date is None:
+        trade_date = datetime.now(tz).strftime('%Y%m%d')
+    cache_key = f"index_{trade_date}"
+    if cache_key in st.session_state.index_cache:
+        return st.session_state.index_cache[cache_key]
+    try:
+        df = pro.index_daily(ts_code='000001.SH', start_date=trade_date, end_date=trade_date)
+        if df is not None and not df.empty:
+            change = df.iloc[0]['pct_chg']  # 涨跌幅百分比
+            st.session_state.index_cache[cache_key] = change
+            return change
+        else:
+            # 若当日无数据，尝试前一日
+            prev_date = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=1)).strftime('%Y%m%d')
+            df = pro.index_daily(ts_code='000001.SH', start_date=prev_date, end_date=prev_date)
+            if df is not None and not df.empty:
+                change = df.iloc[0]['pct_chg']
+                st.session_state.index_cache[cache_key] = change
+                return change
+            return None
+    except Exception as e:
+        add_log("大盘指数", f"获取失败: {str(e)[:50]}")
+        return None
+
+# ===============================
+# 获取流通市值、换手率（保留原功能，用于显示）
 # ===============================
 def batch_get_stock_basic_info(ts_codes, trade_date):
     cache = st.session_state.stock_basic_cache
@@ -138,7 +163,7 @@ def batch_get_stock_basic_info(ts_codes, trade_date):
     return [cache.get(c, {'circ_mv': 0, 'turnover_rate': 0}) for c in ts_codes]
 
 # ===============================
-# 获取主力资金流向（批量）
+# 获取主力资金流向（保留，但不用于选股，仅显示）
 # ===============================
 def batch_get_moneyflow(ts_codes, trade_date):
     cache = st.session_state.moneyflow_cache
@@ -160,7 +185,7 @@ def batch_get_moneyflow(ts_codes, trade_date):
     return [cache.get(c, {'net_inflow_pct': 0}) for c in ts_codes]
 
 # ===============================
-# 个股行业信息获取（原版）
+# 个股行业信息获取（保留）
 # ===============================
 def batch_get_stock_industry(ts_codes):
     cache = st.session_state.stock_industry_cache
@@ -181,7 +206,7 @@ def batch_get_stock_industry(ts_codes):
     return [cache.get(c, '未知') for c in ts_codes]
 
 # ===============================
-# 数据获取（增加市值/换手/资金流）
+# 数据获取（增加市值/换手/资金流，保留原有字段）
 # ===============================
 def fetch_from_tushare():
     try:
@@ -235,7 +260,6 @@ def fetch_from_tushare():
         industries = batch_get_stock_industry(codes)
         df['所属行业'] = industries
         
-        # 新增：获取流通市值、换手率、资金流向
         today_str = datetime.now(tz).strftime('%Y%m%d')
         basic_infos = batch_get_stock_basic_info(codes, today_str)
         df['流通市值'] = [b['circ_mv'] for b in basic_infos]
@@ -283,176 +307,147 @@ def get_stable_realtime_data():
         add_log("数据源", "Tushare 获取失败，返回空")
         return pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率', '主力净流入占比'])
 
-def get_historical_data(ts_code, end_date=None):
+# ===============================
+# 【修改】获取历史数据（增加limit参数，默认120，用于计算120日均线）
+# ===============================
+def get_historical_data(ts_code, end_date=None, limit=120):
     cache = st.session_state.hist_data_cache
-    if ts_code in cache:
-        return cache[ts_code]
+    cache_key = f"{ts_code}_{limit}"
+    if cache_key in cache:
+        return cache[cache_key]
     try:
         if end_date is None:
             end_date = datetime.now(tz).strftime('%Y%m%d')
-        df = pro.daily(ts_code=ts_code, end_date=end_date, limit=60)
+        df = pro.daily(ts_code=ts_code, end_date=end_date, limit=limit)
         if df is not None and not df.empty:
             df = df.sort_values('trade_date')
-            cache[ts_code] = df
+            cache[cache_key] = df
             return df
         else:
-            cache[ts_code] = pd.DataFrame()
+            cache[cache_key] = pd.DataFrame()
             return pd.DataFrame()
     except Exception as e:
-        cache[ts_code] = pd.DataFrame()
+        cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
 # ===============================
-# MACD/KDJ 计算函数
+# 【新增】孕线选股辅助函数
 # ===============================
-def calculate_macd(close, fast=12, slow=26, signal=9):
-    if len(close) < slow + signal:
-        return None, None, None
-    exp1 = pd.Series(close).ewm(span=fast, adjust=False).mean()
-    exp2 = pd.Series(close).ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - signal_line
-    return macd.iloc[-1], signal_line.iloc[-1], hist.iloc[-1]
-
-def calculate_kdj(high, low, close, n=9, m1=3, m2=3):
-    if len(close) < n:
-        return None, None, None
-    low_list = low.rolling(n, min_periods=n).min()
-    high_list = high.rolling(n, min_periods=n).max()
-    rsv = (close - low_list) / (high_list - low_list) * 100
-    rsv = rsv.fillna(50)
-    K = rsv.ewm(span=m1, adjust=False).mean()
-    D = K.ewm(span=m2, adjust=False).mean()
-    J = 3 * K - 2 * D
-    return K.iloc[-1], D.iloc[-1], J.iloc[-1]
-
-def get_macd_bonus(hist_df):
-    if hist_df.empty or len(hist_df) < 26:
-        return 0
-    close = hist_df['close']
-    exp1 = pd.Series(close).ewm(span=12, adjust=False).mean()
-    exp2 = pd.Series(close).ewm(span=26, adjust=False).mean()
-    macd_line = exp1 - exp2
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    if len(macd_line) < 2:
-        return 0
-    prev_macd = macd_line.iloc[-2]
-    prev_signal = signal_line.iloc[-2]
-    curr_macd = macd_line.iloc[-1]
-    curr_signal = signal_line.iloc[-1]
-    if prev_macd <= prev_signal and curr_macd > curr_signal:
-        if curr_macd < 0:
-            return 5
-        else:
-            return 3
-    return 0
-
-def get_kdj_bonus(hist_df):
-    if hist_df.empty or len(hist_df) < 9:
-        return 0
-    high = hist_df['high']
-    low = hist_df['low']
-    close = hist_df['close']
-    k, d, j = calculate_kdj(high, low, close)
-    if k is None or d is None:
-        return 0
-    if len(high) < 2:
-        return 0
-    prev_k, prev_d, prev_j = calculate_kdj(high[:-1], low[:-1], close[:-1])
-    if prev_k is None or prev_d is None:
-        return 0
-    if prev_k <= prev_d and k > d:
-        if j < 20:
-            return 5
-        elif j < 30:
-            return 3
-        else:
-            return 1
-    return 0
-
-# ===============================
-# 量化抛压识别
-# ===============================
-def has_quantum_dump_pressure(row, hist_df):
-    if hist_df.empty or len(hist_df) < 6:
+def is_strong_mother(day, hist_df, lookback=20):
+    """
+    判断母线是否为标志性K线：
+    条件1：当日涨幅为近lookback日最大涨幅
+    条件2：当日成交量为近lookback日最大成交量
+    满足任一即可
+    """
+    if len(hist_df) < lookback + 1:
         return False
-    high_pct = row.get('最高涨幅', 0)
-    cur_pct = row['涨跌幅']
-    if high_pct - cur_pct < 2.5:
+    # 取前lookback日（不含当日）数据
+    prev_data = hist_df.iloc[:-1].tail(lookback)
+    if len(prev_data) < lookback:
         return False
-    avg_vol_5 = hist_df['vol'].tail(5).mean()
-    if avg_vol_5 <= 0:
-        return False
-    vol_ratio = row['成交量'] / avg_vol_5
-    if vol_ratio > 1.3:
+    # 涨幅比较
+    gain = (day['close'] - day['open']) / day['open'] * 100
+    max_gain = ((prev_data['close'] - prev_data['open']) / prev_data['open'] * 100).max()
+    # 成交量比较
+    max_vol = prev_data['vol'].max()
+    if gain >= max_gain or day['vol'] >= max_vol:
         return True
     return False
 
-# ===============================
-# 技术形态评分（与原版一致）
-# ===============================
-def score_technical_conditions(row, hist_df, mode):
-    if hist_df.empty or len(hist_df) < 6:
-        return 0
-    score = 0
-    pct = row['涨跌幅']
-    if mode == "宽松":
-        if 1 <= pct <= 8:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4.5) * 2)
-    elif mode == "标准":
-        if 2 <= pct <= 6.5:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4.25) * 3)
-    else:  # 严格
-        if 2.5 <= pct <= 5.5:
-            score += 10
-        else:
-            score += max(0, 10 - abs(pct - 4) * 4)
+def is_bullish(day, min_gain=5):
+    if day['close'] <= day['open']:
+        return False
+    gain = (day['close'] - day['open']) / day['open'] * 100
+    if gain < min_gain:
+        return False
+    return True
 
+def is_doji_or_bearish(day):
+    body = abs(day['close'] - day['open'])
+    range_ = day['high'] - day['low']
+    if range_ == 0:
+        return True
+    if day['close'] < day['open']:
+        return True
+    if body / range_ < 0.2:
+        return True
+    return False
+
+def find_latest_pregnancy(hist_df, lookback=10, min_gain=5, vol_ratio=1.5):
+    """
+    查找最近孕线组合，且母线为标志性K线（近20日最大涨幅或最大成交量）
+    """
+    if hist_df.empty or len(hist_df) < 20:  # 至少需要20日数据判断标志性
+        return None
+    hist_df = hist_df.copy()
+    hist_df['avg_vol_5'] = hist_df['vol'].rolling(5, min_periods=1).mean()
+    start = max(0, len(hist_df) - lookback - 2)
+    for i in range(len(hist_df)-1, start, -1):
+        day1 = hist_df.iloc[i-1]
+        day2 = hist_df.iloc[i]
+        # 母线：阳线且涨幅达标且放量
+        if day1['close'] <= day1['open']:
+            continue
+        gain1 = (day1['close'] - day1['open']) / day1['open'] * 100
+        if gain1 < min_gain:
+            continue
+        if day1['vol'] < day1['avg_vol_5'] * vol_ratio:
+            continue
+        # 【新增】母线必须为标志性K线
+        if not is_strong_mother(day1, hist_df.iloc[:i]):  # 只用之前的数据判断
+            continue
+        # 子线：阴线或十字星，且完全被母线包容
+        if not is_doji_or_bearish(day2):
+            continue
+        if day2['high'] > day1['high'] or day2['low'] < day1['low']:
+            continue
+        return {'mother_idx': i-1, 'mother': day1, 'child': day2}
+    return None
+
+def check_breakout(today_row, pregnancy_info, hist_df, 
+                   index_change=None, 
+                   max_deviation_from_ma120=0.30,
+                   breakout_threshold=1.01,
+                   vol_ratio_break=1.5,
+                   max_breakthrough_gain=8.0):
+    """
+    突破判断（仅技术面，大盘仅做提醒，不做拦截）
+    """
+    # ========== 已移除大盘强制拦截逻辑，改为UI提醒 ==========
+    
+    mother_high = pregnancy_info['mother']['high']
+    # 2. 价格突破
+    if today_row['最新价'] <= mother_high * breakout_threshold:
+        return False, None, None, "未突破"
+    breakthrough_gain = (today_row['最新价'] - mother_high) / mother_high * 100
+    if breakthrough_gain > max_breakthrough_gain:
+        return False, None, None, "追高风险"
+    
+    # 3. 放量确认
+    if len(hist_df) < 5:
+        return False, None, None, "历史数据不足"
     avg_vol_5 = hist_df['vol'].tail(5).mean()
-    if avg_vol_5 > 0:
-        vr = row['成交量'] / avg_vol_5
-        if mode == "宽松":
-            if 0.8 <= vr <= 2.5:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.65) * 2)
-        elif mode == "标准":
-            if 1.0 <= vr <= 2.0:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.5) * 3)
-        else:  # 严格
-            if 1.2 <= vr <= 1.8:
-                score += 10
-            else:
-                score += max(0, 10 - abs(vr - 1.5) * 4)
-
-    recent_3 = hist_df['close'].tail(3).values
-    if len(recent_3) == 3 and recent_3[0] < recent_3[1] < recent_3[2]:
-        score += 5
-
-    ma5 = hist_df['close'].rolling(5).mean().iloc[-1]
-    if not np.isnan(ma5) and row['最新价'] >= ma5:
-        score += 5
-
-    hist_5 = hist_df.tail(5)
-    if ((hist_5['close'] - hist_5['open']) > 0).any():
-        score += 5
-
-    return min(score, 30)
+    if avg_vol_5 == 0 or today_row['成交量'] < avg_vol_5 * vol_ratio_break:
+        return False, None, None, "量能不足"
+    vol_ratio = today_row['成交量'] / avg_vol_5
+    
+    # 4. 【新增】相对位置过滤：股价偏离120日均线不超过30%
+    if len(hist_df) >= 120:
+        ma120 = hist_df['close'].tail(120).mean()
+        if ma120 > 0:
+            deviation = (today_row['最新价'] - ma120) / ma120
+            if deviation > max_deviation_from_ma120:
+                return False, None, None, "位置过高"
+            # 低于均线过多也谨慎（可选，这里不拒绝）
+    return True, breakthrough_gain, vol_ratio, "突破有效"
 
 # ===============================
-# 板块强度计算（5日动量加权）
+# 板块强度计算（保留原版，用于主线过滤）
 # ===============================
 def calculate_sector_strength_momentum(df_today):
     if df_today.empty or '所属行业' not in df_today.columns:
         return pd.DataFrame()
-    # 1. 当日强度
     df_today['is_limit_up'] = df_today['涨跌幅'] >= 9.5
     today_sector = df_today.groupby('所属行业').agg({
         '涨跌幅': 'mean',
@@ -465,12 +460,10 @@ def calculate_sector_strength_momentum(df_today):
     today_sector['当日强度'] = (today_sector['涨跌幅'].rank(pct=True) * 40 +
                                 today_sector['资金占比'].rank(pct=True) * 40 +
                                 today_sector['涨停占比'].rank(pct=True) * 20)
-    
-    # 2. 5日动量（简化：使用前100只成交额最大的股票计算）
     top_stocks = df_today.nlargest(100, '成交额')
     stock_5d = {}
     for _, row in top_stocks.iterrows():
-        hist = get_historical_data(row['代码'])
+        hist = get_historical_data(row['代码'], limit=30)  # 用30天即可
         if hist is not None and not hist.empty and len(hist) >= 6:
             close_vals = hist['close'].values
             pct_5d = (close_vals[-1] - close_vals[-6]) / close_vals[-6] * 100
@@ -482,7 +475,6 @@ def calculate_sector_strength_momentum(df_today):
         if not np.isnan(pct):
             sector_5d.setdefault(ind, []).append(pct)
     sector_5d_avg = {ind: np.mean(vals) for ind, vals in sector_5d.items()}
-    # 转换为百分位得分
     if sector_5d_avg:
         sectors = list(sector_5d_avg.keys())
         values = list(sector_5d_avg.values())
@@ -490,19 +482,17 @@ def calculate_sector_strength_momentum(df_today):
         momentum_score = {sectors[i]: ranks.iloc[i] for i in range(len(sectors))}
     else:
         momentum_score = {}
-    
-    # 3. 合并：40%当日强度 + 60%5日动量
     final_scores = []
     for sector in today_sector.index:
         today = today_sector.loc[sector, '当日强度']
-        momentum = momentum_score.get(sector, today)  # 无动量则用当日
+        momentum = momentum_score.get(sector, today)
         weighted = 0.4 * today + 0.6 * momentum
         final_scores.append(weighted)
     today_sector['强度得分'] = final_scores
     return today_sector.sort_values('强度得分', ascending=False)
 
 # ===============================
-# 原有辅助函数（保留，但部分不再调用）
+# 过滤ST和异常（保留）
 # ===============================
 def filter_stocks_by_rule(df):
     if df.empty:
@@ -513,29 +503,17 @@ def filter_stocks_by_rule(df):
     if '涨跌幅' in filtered.columns:
         filtered = filtered[filtered['涨跌幅'] <= 9.5]
     if '最高涨幅' in filtered.columns and '涨跌幅' in filtered.columns:
-        # 炸板剔除：曾涨停未封死
         filtered = filtered[~((filtered['最高涨幅'] > 9.5) & (filtered['涨跌幅'] < 7))]
     if not filtered.empty and '成交额' in filtered.columns:
         threshold = max(filtered['成交额'].quantile(0.1), 2e7)
         filtered = filtered[filtered['成交额'] > threshold]
     return filtered
 
-def calculate_technical_indicators(hist_df):
-    return {}
-def add_technical_indicators(df, top_n=200):
-    return df
-def calculate_composite_score(df, sector_avg_change, weights, strongest_sector=None):
-    return df
-def update_convergence(candidates_df, current_time):
-    pass
-def get_final_recommendation_from_convergence():
-    return None, []
-
 # ===============================
 # 主程序
 # ===============================
 now = datetime.now(tz)
-st.title("🔥 尾盘博弈 6.3 · 互补评分增强版（资金流+金叉+抛压+5日动量）")
+st.title("🔥 尾盘博弈 6.3 · 孕线突破增强版（大盘风险提示不拦截）")
 st.write(f"当前北京时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if st.session_state.today != now.date():
@@ -554,10 +532,11 @@ if st.session_state.today != now.date():
     st.session_state.final_locked = False
     st.session_state.stock_basic_cache = {}
     st.session_state.moneyflow_cache = {}
+    st.session_state.index_cache = {}
     add_log("系统", "新交易日开始，重置所有状态")
     st.rerun()
 
-# 侧边栏（与原版一致，增加说明）
+# 侧边栏（保留原样，增加说明）
 with st.sidebar:
     st.markdown("### 🎛️ 控制面板")
     st.markdown("#### 📊 数据源状态")
@@ -589,6 +568,7 @@ with st.sidebar:
         st.session_state.stock_industry_cache = {}
         st.session_state.stock_basic_cache = {}
         st.session_state.moneyflow_cache = {}
+        st.session_state.index_cache = {}
         st.session_state.candidate_df = pd.DataFrame()
         add_log("手动操作", "清除缓存，强制刷新")
         st.success("已清除缓存，将尝试重新获取")
@@ -609,31 +589,14 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ⚙️ 多因子权重配置")
-    w_price = st.slider("当日涨幅", 0.0, 0.5, 0.20, 0.05, key="w_price")
-    w_volume = st.slider("成交额", 0.0, 0.5, 0.15, 0.05, key="w_volume")
-    w_momentum = st.slider("5日动量", 0.0, 0.4, 0.15, 0.05, key="w_momentum")
-    w_reversal = st.slider("20日反转", 0.0, 0.3, 0.10, 0.05, key="w_reversal")
-    w_vol_ratio = st.slider("量比", 0.0, 0.3, 0.10, 0.05, key="w_vol_ratio")
-    w_volatility = st.slider("波动率(负)", -0.2, 0.0, -0.05, 0.05, key="w_volatility")
-    total_weight = w_price + w_volume + w_momentum + w_reversal + w_vol_ratio + w_volatility
-    if abs(total_weight - 1.0) > 0.2:
-        st.warning(f"权重和: {total_weight:.2f} (建议调整到1.0附近)")
-    factor_weights = {
-        '涨跌幅': w_price,
-        '成交额': w_volume,
-        '5日动量': w_momentum,
-        '20日反转': w_reversal,
-        '量比': w_vol_ratio,
-        '波动率': w_volatility
-    }
-    
+    st.markdown("#### ⚙️ 孕线参数调节")
+    min_mother_gain = st.slider("母线最小涨幅(%)", 3, 10, 5, 1, key="min_gain")
+    vol_ratio_mother = st.slider("母线放量倍数(>5日均量)", 1.2, 3.0, 1.5, 0.1, key="vol_mother")
+    vol_ratio_break = st.slider("突破放量倍数(>5日均量)", 1.2, 3.0, 1.5, 0.1, key="vol_break")
+    max_break_gain = st.slider("突破最大涨幅(%)", 3, 12, 8, 1, key="max_break")
+    st.caption("💡 以上参数影响选股灵敏度，默认适用于大多数情况")
     st.markdown("---")
-    st.markdown("#### 🎚️ 策略模式选择")
-    strategy_mode = st.selectbox("策略模式", ["宽松模式", "标准模式", "严格模式"], index=1, key="strategy_mode")
-    st.caption("💡 宽松模式信号多 | 标准模式平衡 | 严格模式确定性高")
-    st.markdown("---")
-    st.info("📌 增强版已集成：5日动量板块、资金流验证、MACD/KDJ金叉、抛压/炸板剔除。")
+    st.info("📌 增强版已集成：大盘环境提示、相对位置过滤、标志性K线识别。")
 
 # 时间处理
 if use_real_time == "模拟测试" and "simulated_time" in st.session_state:
@@ -721,7 +684,7 @@ except Exception as e:
     st.error(f"❌ 数据获取失败: {str(e)}")
     df = pd.DataFrame(columns=['代码', '名称', '涨跌幅', '成交额', '所属行业', '流通市值', '换手率', '主力净流入占比'])
 
-# 板块分析（使用5日动量加权）
+# 板块分析（保留）
 st.markdown("### 📊 板块热度分析（5日动量加权主线）")
 if df.empty or '所属行业' not in df.columns:
     st.info("当前无有效板块数据，跳过板块分析。")
@@ -737,143 +700,188 @@ else:
         top5_sectors = []
         st.warning("未识别主线板块，使用全市场")
 
-# 选股流程
-st.markdown("### 🎯 互补评分选股引擎（增强版：资金流+金叉+抛压剔除）")
+# ===============================
+# 选股流程（孕线突破法，集成所有增强过滤，大盘仅提示）
+# ===============================
+st.markdown("### 🎯 孕线突破选股引擎（标志性母线 + 位置/放量确认）")
 if df.empty:
     st.info("当前无股票数据，无法进行选股。")
     top_candidate = None
 else:
-    # 基础过滤（ST、涨跌幅上限、炸板剔除已在filter_stocks_by_rule中实现）
-    filtered = filter_stocks_by_rule(df)
-    st.caption(f"基础过滤后（含炸板剔除）: {len(filtered)}")
-    # 主线板块过滤
-    if not top5_sectors:
-        sector_filtered = filtered
-        st.warning("未识别主线板块，使用全市场")
+    # 获取大盘指数涨跌幅（仅用于风险提示，不再拦截选股）
+    today_str = datetime.now(tz).strftime('%Y%m%d')
+    index_change = get_index_change(today_str)
+    
+    # 标记大盘风险状态（供后续UI使用）
+    is_index_risky = False
+    if index_change is not None:
+        st.caption(f"📉 上证指数今日涨跌幅: {index_change:.2f}%")
+        if index_change < -1.0:
+            is_index_risky = True
+            # 使用红色大框警告，但明确提示继续选股
+            st.error(
+                "🚨 **高风险预警**：今日上证指数跌幅超过 -1%！\n\n"
+                "市场系统性风险较大，当前孕线突破信号的**失败概率显著升高**。\n"
+                "⚠️ 策略将继续为您选出标的，但建议 **仓位减半** 或 **严格设置-2%止损**！"
+            )
+        else:
+            st.success("✅ 大盘环境相对平稳，可正常参与")
     else:
+        st.info("无法获取大盘指数，风险未知，请自行谨慎")
+
+    # 基础过滤
+    filtered = filter_stocks_by_rule(df)
+    st.caption(f"基础过滤后股票数: {len(filtered)}")
+
+    # 主线板块过滤（可选）
+    if top5_sectors:
         sector_filtered = filtered[filtered['所属行业'].isin(top5_sectors)]
         st.caption(f"主线板块过滤后股票数: {len(sector_filtered)}")
-    
+        if sector_filtered.empty:
+            st.warning("主线板块内无股票，改为全市场选股")
+            sector_filtered = filtered
+    else:
+        sector_filtered = filtered
+
     if sector_filtered.empty:
-        st.warning("主线板块内无股票，无法进行选股。")
+        st.warning("无股票可分析。")
         top_candidate = None
         st.session_state.candidate_df = pd.DataFrame()
     else:
-        MAX_CHECK = 200
-        tmp = sector_filtered.copy()
-        tmp['涨跌幅_pct'] = tmp['涨跌幅'].rank(pct=True)
-        tmp['成交额_pct'] = tmp['成交额'].rank(pct=True)
-        tmp['_pre_score'] = (tmp['涨跌幅_pct'] + tmp['成交额_pct']) / 2
-        tmp = tmp.sort_values('_pre_score', ascending=False)
-        to_check = tmp.head(MAX_CHECK)
-        st.caption(f"将对前 {len(to_check)} 只潜力股进行深度评分...")
-        
+        # 按成交额排序，优先活跃股
+        sector_filtered = sector_filtered.sort_values('成交额', ascending=False)
+        to_check = sector_filtered.head(200)
+        st.caption(f"将对前 {len(to_check)} 只活跃股进行孕线突破检测...")
+
         progress_bar = st.progress(0)
         status_text = st.empty()
-        candidates_with_scores = []
+        candidates = []
+
         for i, (idx, row) in enumerate(to_check.iterrows()):
             status_text.text(f"正在分析 {i+1}/{len(to_check)}: {row['名称']}")
-            hist = get_historical_data(row['代码'])
-            if hist.empty:
+            # 获取历史数据（120天用于均线判断）
+            hist = get_historical_data(row['代码'], limit=120)
+            if hist.empty or len(hist) < 25:  # 至少需要25天（20天判断标志性 + 5天均量）
                 progress_bar.progress((i+1)/len(to_check))
                 continue
-            # 量化抛压识别
-            if has_quantum_dump_pressure(row, hist):
+            # 查找最近孕线（参数可从侧边栏获取）
+            pregnancy = find_latest_pregnancy(
+                hist, 
+                lookback=10, 
+                min_gain=st.session_state.get('min_gain', 5),
+                vol_ratio=st.session_state.get('vol_mother', 1.5)
+            )
+            if pregnancy is None:
                 progress_bar.progress((i+1)/len(to_check))
                 continue
-            # 技术形态得分
-            tech_score = score_technical_conditions(row, hist, strategy_mode.replace("模式", ""))
-            # 综合得分（基于涨跌幅和成交额排名）
-            temp_score = row['_pre_score']
-            base_score = temp_score * 70
-            # 资金流加分
-            fund_bonus = 5 if row.get('主力净流入占比', 0) > 2 else 0
-            # MACD/KDJ金叉加分
-            macd_bonus = get_macd_bonus(hist)
-            kdj_bonus = get_kdj_bonus(hist)
-            gold_bonus = macd_bonus + kdj_bonus
-            # 最终总分
-            final_score = base_score + tech_score + fund_bonus + gold_bonus
-            final_score = min(100, final_score)
-            candidates_with_scores.append({
+            # 突破判断（集成所有过滤，大盘仅传递不拦截）
+            is_break, break_gain, vol_ratio, reject_reason = check_breakout(
+                row, pregnancy, hist,
+                index_change=index_change,  # 只用于显示，不做拦截
+                max_deviation_from_ma120=0.30,   # 偏离120日均线不超过30%
+                breakout_threshold=1.01,
+                vol_ratio_break=st.session_state.get('vol_break', 1.5),
+                max_breakthrough_gain=st.session_state.get('max_break', 8.0)
+            )
+            if not is_break:
+                progress_bar.progress((i+1)/len(to_check))
+                continue
+            # 收集候选
+            mother = pregnancy['mother']
+            child = pregnancy['child']
+            mother_gain = (mother['close'] - mother['open']) / mother['open'] * 100
+            score = (break_gain * 30 + vol_ratio * 30 + mother_gain * 20)
+            # 计算偏离120日均线
+            if len(hist) >= 120:
+                ma120 = hist['close'].tail(120).mean()
+                dev_ma120 = (row['最新价'] - ma120) / ma120 * 100 if ma120 > 0 else np.nan
+            else:
+                dev_ma120 = np.nan
+
+            candidates.append({
                 '代码': row['代码'],
                 '名称': row['名称'],
+                '最新价': row['最新价'],
                 '涨跌幅': row['涨跌幅'],
                 '成交额': row['成交额'],
-                '最新价': row['最新价'],
-                '技术得分': tech_score,
-                '综合得分': base_score,
-                '资金流分': fund_bonus,
-                '金叉加分': gold_bonus,
-                '最终总分': final_score,
                 '所属行业': row['所属行业'],
-                '主力净流入占比': row.get('主力净流入占比', 0)
+                '母线日期': mother['trade_date'],
+                '母线涨幅': mother_gain,
+                '母线最高价': mother['high'],
+                '子线日期': child['trade_date'],
+                '子线实体': (child['close'] - child['open']) / child['open'] * 100,
+                '突破幅度': break_gain,
+                '放量倍数': vol_ratio,
+                '偏离120日均线': dev_ma120,
+                '综合得分': score,
+                '大盘风险': is_index_risky   # 标记当前大盘风险状态
             })
             progress_bar.progress((i+1)/len(to_check))
+
         progress_bar.empty()
         status_text.empty()
-        
-        if not candidates_with_scores:
-            st.warning("未获取到任何候选股票（可能是历史数据获取失败）。")
+
+        if not candidates:
+            st.warning("未发现任何符合孕线突破条件的股票。")
             top_candidate = None
             st.session_state.candidate_df = pd.DataFrame()
         else:
-            scored_df = pd.DataFrame(candidates_with_scores)
-            scored_df = scored_df.sort_values('最终总分', ascending=False)
+            scored_df = pd.DataFrame(candidates)
+            scored_df = scored_df.sort_values('综合得分', ascending=False)
             top_candidates = scored_df.head(10)
             top_candidate = top_candidates.iloc[0].to_dict() if not top_candidates.empty else None
             st.session_state.candidate_df = top_candidates.copy()
-            
+
             st.markdown("#### 📈 优选股票综合分析")
             if top_candidate:
                 col_info, col_factors = st.columns([1, 2])
                 with col_info:
                     st.metric("**选中股票**", f"{top_candidate.get('名称', 'N/A')}")
                     st.metric("**代码**", f"{top_candidate.get('代码', 'N/A')}")
-                    st.metric("**最终总分**", f"{top_candidate.get('最终总分', 0):.2f}")
-                    st.metric("**技术得分**", f"{top_candidate.get('技术得分', 0):.2f}/30")
-                    st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.2f}/70")
-                    if '涨跌幅' in top_candidate:
-                        st.metric("**今日涨幅**", f"{top_candidate['涨跌幅']:.2f}%")
-                    st.metric("**主力净流入占比**", f"{top_candidate.get('主力净流入占比', 0):.2f}%")
+                    st.metric("**综合得分**", f"{top_candidate.get('综合得分', 0):.1f}")
+                    st.metric("**今日涨幅**", f"{top_candidate.get('涨跌幅', 0):.2f}%")
+                    st.metric("**突破幅度**", f"{top_candidate.get('突破幅度', 0):.2f}%")
+                    st.metric("**放量倍数**", f"{top_candidate.get('放量倍数', 0):.2f}x")
+                    # 风险提示
+                    if top_candidate.get('大盘风险', False):
+                        st.error("⚠️ 当前处于**大盘高风险**状态，建议轻仓！")
+                    else:
+                        st.success("✅ 大盘环境正常")
                 with col_factors:
-                    st.write("增强因子加分情况")
-                    st.write(f"- 资金流加分: +{top_candidate.get('资金流分', 0)}")
-                    st.write(f"- MACD/KDJ金叉加分: +{top_candidate.get('金叉加分', 0)}")
-                    st.write("额外剔除条件：量化抛压、炸板已过滤")
-            
-            st.markdown("#### 🏆 候选股票排名 (按最终总分前5)")
+                    st.write("**孕线参数**")
+                    st.write(f"- 母线日期: {top_candidate.get('母线日期', '')}")
+                    st.write(f"- 母线涨幅: {top_candidate.get('母线涨幅', 0):.2f}%")
+                    st.write(f"- 母线最高价: {top_candidate.get('母线最高价', 0):.2f}")
+                    st.write(f"- 子线日期: {top_candidate.get('子线日期', '')}")
+                    st.write(f"- 子线实体: {top_candidate.get('子线实体', 0):.2f}%")
+                    st.write(f"- 偏离120日均线: {top_candidate.get('偏离120日均线', 0):.1f}%")
+                    st.write("**过滤条件**：标志性K线✓ 相对位置✓ 放量确认✓")
+
+            st.markdown("#### 🏆 候选股票排名 (按综合得分前5)")
             if not top_candidates.empty:
-                display_df = top_candidates[['名称', '代码', '涨跌幅', '成交额', '技术得分', '综合得分', '资金流分', '金叉加分', '最终总分']].head().copy()
+                display_df = top_candidates[['名称', '代码', '涨跌幅', '成交额', '母线涨幅', '突破幅度', '放量倍数', '综合得分']].head().copy()
                 display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
                 display_df['成交额'] = display_df['成交额'].apply(lambda x: f"{x/1e8:.2f}亿")
-                display_df['技术得分'] = display_df['技术得分'].apply(lambda x: f"{x:.1f}")
+                display_df['母线涨幅'] = display_df['母线涨幅'].apply(lambda x: f"{x:.2f}%")
+                display_df['突破幅度'] = display_df['突破幅度'].apply(lambda x: f"{x:.2f}%")
+                display_df['放量倍数'] = display_df['放量倍数'].apply(lambda x: f"{x:.2f}x")
                 display_df['综合得分'] = display_df['综合得分'].apply(lambda x: f"{x:.1f}")
-                display_df['最终总分'] = display_df['最终总分'].apply(lambda x: f"{x:.1f}")
                 st.dataframe(display_df, use_container_width=True)
-            
-            # 收敛记录（下午2:00-2:40）- 原版功能，保留
-            if current_hour == 14 and current_minute < 40:
-                # 此处原版调用update_convergence，但该函数依赖风险调整得分等，为简化可保留空实现
-                pass
-            
-            # 14:40 自动锁定最终推荐（原版功能，保留）
-            if is_final_lock_time and not st.session_state.locked and st.session_state.convergence_records:
-                # 原版收敛推荐逻辑，因增强版已改动较多，暂保留空，避免报错
-                pass
-            
+
+            # 保存用于自动推荐的候选
             st.session_state.test_top_stock = {
                 'name': top_candidate.get('名称', ''),
                 'code': top_candidate.get('代码', ''),
                 '涨跌幅': float(top_candidate.get('涨跌幅', 0)),
                 '成交额': float(top_candidate.get('成交额', 0)),
-                '最终总分': float(top_candidate.get('最终总分', 0)),
+                '最终总分': float(top_candidate.get('综合得分', 0)),
                 'time': current_time_str,
                 'sector': ', '.join(top5_sectors) if top5_sectors else '全市场',
-                'data_source': st.session_state.data_source
+                'data_source': st.session_state.data_source,
+                '大盘风险': is_index_risky
             }
 
-# 自动推荐（首次推荐13:30-14:00）- 原版功能
+# 自动推荐（保留原有逻辑，但字段名适配）
 st.markdown("### 🤖 自动推荐系统")
 use_real_data = st.session_state.data_source in ["real_data", "cached_real_data"]
 if not use_real_data:
@@ -887,15 +895,18 @@ else:
             '成交额': float(top_candidate.get('成交额', 0)),
             'time': current_time_str,
             'auto': True,
-            'final_score': float(top_candidate.get('最终总分', 0)),
+            'final_score': float(top_candidate.get('综合得分', 0)),
             'sector': top_candidate.get('所属行业', '主线板块'),
-            'data_source': st.session_state.data_source
+            'data_source': st.session_state.data_source,
+            '突破幅度': top_candidate.get('突破幅度', 0),
+            '放量倍数': top_candidate.get('放量倍数', 0),
+            '大盘风险': top_candidate.get('大盘风险', False)
         }
         add_log("自动推荐", f"生成首次推荐: {top_candidate.get('名称', '')}")
         st.success(f"🕐 **首次推荐已生成**: {top_candidate.get('名称', '')}")
         st.rerun()
 
-# 推荐显示区域（与原版完全一致）
+# 推荐显示区域（适配新字段）
 st.markdown("---")
 st.markdown("### 📋 推荐结果")
 col_rec1, col_rec2 = st.columns(2)
@@ -904,14 +915,20 @@ with col_rec1:
     if st.session_state.morning_pick is not None:
         pick = st.session_state.morning_pick
         data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
+        risk_html = ""
+        if pick.get('大盘风险', False):
+            risk_html = '<p style="color:red; font-weight:bold; background-color:#ffe6e6; padding:8px; border-radius:4px;">🚨 大盘高风险信号，请严控仓位！</p>'
         st.markdown(f"""
         <div style="background-color: #f0f9ff; padding: 20px; border-radius: 10px; border-left: 5px solid #3498db;">
             <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            {risk_html}
             <p><strong>📅 推荐时间:</strong> {pick['time']}</p>
             <p><strong>📈 当前涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
             <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
             <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
+            <p><strong>📈 突破幅度:</strong> {pick.get('突破幅度', 0):.2f}%</p>
+            <p><strong>📊 放量倍数:</strong> {pick.get('放量倍数', 0):.2f}x</p>
             <p><strong>🔧 来源:</strong> {'自动生成' if pick.get('auto', False) else '手动设置'}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -934,15 +951,21 @@ with col_rec2:
     st.subheader("🎯 最终锁定 (14:40后)")
     if st.session_state.final_pick is not None:
         pick = st.session_state.final_pick
+        risk_html = ""
+        if pick.get('大盘风险', False):
+            risk_html = '<p style="color:red; font-weight:bold; background-color:#ffe6e6; padding:8px; border-radius:4px;">🚨 大盘高风险信号，请严控仓位！</p>'
         data_source_tag = {"real_data": "🟢 Tushare", "cached_real_data": "🟡 缓存"}.get(pick.get('data_source', ''), '')
         st.markdown(f"""
         <div style="background-color: #fff3cd; padding: 20px; border-radius: 10px; border-left: 5px solid #f39c12;">
             <h3 style="margin-top: 0; color: #2c3e50;">{pick['name']} ({pick['code']}) {data_source_tag}</h3>
+            {risk_html}
             <p><strong>📅 锁定时间:</strong> {pick['time']}</p>
             <p><strong>📈 锁定涨幅:</strong> <span style="color: {'red' if pick['涨跌幅'] > 0 else 'green'}">{pick['涨跌幅']:.2f}%</span></p>
             <p><strong>💰 成交额:</strong> {pick['成交额']/1e8:.2f}亿</p>
             <p><strong>📊 所属板块:</strong> {pick.get('sector', 'N/A')}</p>
-            <p><strong>🏆 最终总分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
+            <p><strong>🏆 综合得分:</strong> {pick.get('final_score', 'N/A'):.2f}</p>
+            <p><strong>📈 突破幅度:</strong> {pick.get('突破幅度', 0):.2f}%</p>
+            <p><strong>📊 放量倍数:</strong> {pick.get('放量倍数', 0):.2f}x</p>
             <p><strong>🔒 状态:</strong> {'已锁定' if st.session_state.locked else '未锁定'}</p>
             <p><strong>🔧 来源:</strong> {'自动锁定' if pick.get('auto', False) else '手动设置'}</p>
         </div>
@@ -980,7 +1003,7 @@ with col_rec2:
         else:
             st.info("⏰ 最终锁定时段: 14:40后")
 
-# 手动选择
+# 手动选择（适配）
 if not st.session_state.candidate_df.empty and not st.session_state.final_locked:
     st.markdown("#### 🖱️ 手动选择（可覆盖自动锁定）")
     manual_options = {f"{row['名称']} ({row['代码']})": idx for idx, row in st.session_state.candidate_df.head(5).iterrows()}
@@ -995,34 +1018,11 @@ if not st.session_state.candidate_df.empty and not st.session_state.final_locked
             '成交额': row['成交额'],
             'time': current_time_str,
             'auto': False,
-            'final_score': row['最终总分']
+            'final_score': row['综合得分'],
+            'sector': row.get('所属行业', ''),
+            '突破幅度': row.get('突破幅度', 0),
+            '放量倍数': row.get('放量倍数', 0),
+            '大盘风险': row.get('大盘风险', False)
         }
         st.session_state.final_locked = True
-        add_log("手动操作", f"手动锁定最终推荐: {row['名称']}")
         st.rerun()
-
-# 系统日志
-with st.expander("📜 系统日志", expanded=False):
-    if st.session_state.logs:
-        for log in reversed(st.session_state.logs[-10:]):
-            color = "#3498db" if "成功" in log['event'] or "生成" in log['event'] else \
-                    "#e74c3c" if "失败" in log['event'] or "异常" in log['event'] else \
-                    "#f39c12" if "警告" in log['event'] or "延迟" in log['event'] else "#2c3e50"
-            st.markdown(f"""
-            <div style="border-left: 3px solid {color}; padding-left: 10px; margin: 5px 0;">
-                <strong>{log['timestamp']}</strong> - {log['event']}: {log['details']}
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.info("暂无日志记录")
-
-# 自动刷新
-if is_trading:
-    refresh_time = 30
-    st.write(f"⏳ {refresh_time}秒后自动刷新数据...")
-    time.sleep(refresh_time)
-    st.rerun()
-else:
-    st.info("⏸️ 当前非交易时间，自动刷新已暂停")
-    time.sleep(60)
-    st.rerun()
