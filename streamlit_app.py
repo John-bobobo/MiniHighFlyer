@@ -38,7 +38,7 @@ st.set_page_config(page_title="尾盘博弈 6.3 · 孕线突破增强版", layou
 # 🔑 Tushare Token
 # ===============================
 try:
-    TUSHARE_TOKEN = "71151389db95e7d4d40670f27c3e3d6833fd7f648bcf48e9a74833cd"
+    TUSHARE_TOKEN = "255fc3500f4adb8bdf00643249b2efd94b983b98a67cf0d8023d78b9"
 except KeyError:
     st.error("未找到 Tushare Token，请在 Secrets 中设置 `tushare_token`")
     st.stop()
